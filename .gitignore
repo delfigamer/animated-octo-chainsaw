@@ -1,0 +1,10 @@
+/.vs
+/Debug
+/Release
+/x64
+/ForwardTracer/Debug
+/ForwardTracer/Release
+/ForwardTracer/x64
+*.aps
+*.filters
+*.user

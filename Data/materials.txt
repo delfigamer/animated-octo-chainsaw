@@ -1,0 +1,15 @@
+>> A_Flr-Cor6
+    Albedo: D:\rt\textures\reference\gridd.png
+    Roughness: D:\rt\textures\reference\gridb.png
+    #Albedo: D:\rt\textures\reference\20.png
+>> Light5
+    Emit: D:\rt\textures\emit\Light5b.png
+    #Emit: D:\rt\textures\reference\100.png
+    EmitGain: 20, 20, 20
+    Albedo: D:\rt\textures\diffuse\Light5.png
+>> SpecGlas
+    #Albedo: D:\rt\textures\reference\80.png
+    Transparency: D:\rt\textures\reference\100.png
+    RIndex: 1.15
+    #TransmittanceSpectrum: 1
+    #TransmittanceLength: 384
