@@ -26,9 +26,12 @@ static bool IsSavedIndex(int index)
     case 4:
     case 8:
     case 16:
+    case 32:
+    case 64:
+    case 128:
         return true;
     default:
-        return true;
+        return index % 256 == 0;
     }
 }
 

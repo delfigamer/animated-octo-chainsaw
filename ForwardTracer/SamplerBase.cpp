@@ -5,50 +5,6 @@
 #include <cstdio>
 #include <cmath>
 
-static float DeltaFactor(int a, int b)
-{
-    return a == b ? 1.0f : 0.0f;
-}
-
-static float DctFactor(int a, int b)
-{
-    static float table[8][8] = {
-        { +0.35355339f, +0.35355339f, +0.35355339f, +0.35355339f, +0.35355339f, +0.35355339f, +0.35355339f, +0.35355339f },
-        { +0.49039264f, +0.41573480f, +0.27778511f, +0.09754516f, -0.09754516f, -0.27778511f, -0.41573480f, -0.49039264f },
-        { +0.46193976f, +0.19134171f, -0.19134171f, -0.46193976f, -0.46193976f, -0.19134171f, +0.19134171f, +0.46193976f },
-        { +0.41573480f, -0.09754516f, -0.49039264f, -0.27778511f, +0.27778511f, +0.49039264f, +0.09754516f, -0.41573480f },
-        { +0.35355339f, -0.35355339f, -0.35355339f, +0.35355339f, +0.35355339f, -0.35355339f, -0.35355339f, +0.35355339f },
-        { +0.27778511f, -0.49039264f, +0.09754516f, +0.41573480f, -0.41573480f, -0.09754516f, +0.49039264f, -0.27778511f },
-        { +0.19134171f, -0.46193976f, +0.46193976f, -0.19134171f, -0.19134171f, +0.46193976f, -0.46193976f, +0.19134171f },
-        { +0.09754516f, -0.27778511f, +0.41573480f, -0.49039264f, +0.49039264f, -0.41573480f, +0.27778511f, -0.09754516f } };
-    if (a >= 0 && a < 8 && b >= 0 && b < 8) {
-        return table[a][b];
-    } else {
-        return 0;
-    }
-}
-
-static float HaarFactor(int a, int b)
-{
-    constexpr float q1 = 0.3535534f;
-    constexpr float q2 = 0.5f;
-    constexpr float q3 = 0.7071068f;
-    static float table[8][8] = {
-        { q1, q1, q1, q1, q1, q1, q1, q1 },
-        { q1, q1, q1, q1, -q1, -q1, -q1, -q1 },
-        { q2, q2, -q2, -q2, 0, 0, 0, 0 },
-        { 0, 0, 0, 0, q2, q2, -q2, -q2 },
-        { q3, -q3, 0, 0, 0, 0, 0, 0 },
-        { 0, 0, q3, -q3, 0, 0, 0, 0 },
-        { 0, 0, 0, 0, q3, -q3, 0, 0 },
-        { 0, 0, 0, 0, 0, 0, q3, -q3 } };
-    if (a >= 0 && a < 8 && b >= 0 && b < 8) {
-        return table[a][b];
-    } else {
-        return 0;
-    }
-}
-
 void SamplerBase::PerfCounter::SampleStart(int64_t& tmp)
 {
     tmp = (int64_t)__rdtsc();
@@ -155,7 +111,7 @@ bool SamplerBase::TestVisible(FPoint from, FPoint to)
     return r;
 }
 
-float SamplerBase::SupportKernel(float x)
+float SamplerBase::KernelP(float x)
 {
     if (x < -1) {
         return 0;
@@ -168,16 +124,41 @@ float SamplerBase::SupportKernel(float x)
     }
 }
 
-float SamplerBase::SupportIntegral(float x)
+float SamplerBase::KernelA(float x)
 {
-    if (x < -1) {
+    if (x < -5) {
         return 0;
-    } else if (x < 0) {
-        return (-0.5f * x + 1.0f) * x + 0.5f;
-    } else if (x < 1) {
-        return (0.5f * x + 1.0f) * x + 0.5f;
+    } else if (x < -4) {
+        return (1.0f / 9) * (5 + x);
+    } else if (x < 4) {
+        return (1.0f / 9);
+    } else if (x < 5) {
+        return (1.0f / 9) * (5 - x);
     } else {
-        return 1;
+        return 0;
+    }
+}
+
+float SamplerBase::KernelB(float x)
+{
+    if (x < -5) {
+        return 0;
+    } else if (x < -4) {
+        float t = 5 + x;
+        return - (1.0f / 18) * t * t;
+    } else if (x < -1) {
+        return - (1.0f / 9) * (4.5f + x);
+    } else if (x < 0) {
+        return (1.0f / 2) * x * (16 / 9.0f + x);
+    } else if (x < 1) {
+        return - (1.0f / 2) * x * (- 16 / 9.0f + x);
+    } else if (x < 4) {
+        return (1.0f / 9) * (4.5f - x);
+    } else if (x < 5) {
+        float t = -5 + x;
+        return (1.0f / 18) * t * t;
+    } else {
+        return 0;
     }
 }
 
@@ -204,60 +185,33 @@ static int Ceil(float x)
 
 void SamplerBase::RecordToFrame(float x, float y, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy)
 {
-    int minxb = Clip(Floor(0.125f * x), 0, blockwidth);
-    int maxxb = Clip(Ceil(0.125f * (x + 1)), 0, blockwidth);
-    int minyb = Clip(Floor(0.125f * y), 0, blockheight);
-    int maxyb = Clip(Ceil(0.125f * (y + 1)), 0, blockheight);
+    int minx = Clip(Floor(x - 5), 0, width);
+    int maxx = Clip(Ceil(x + 6), 0, width);
+    int miny = Clip(Floor(y - 5), 0, height);
+    int maxy = Clip(Ceil(y + 6), 0, height);
     float invwidth = 1.0f / width;
     float invheight = 1.0f / height;
-    for (int yb = minyb; yb < maxyb; ++yb) {
-        for (int xb = minxb; xb < maxxb; ++xb) {
-            float rx = x - xb * 8;
-            float ry = y - yb * 8;
-            FrameBlock& block = frames[currentframe][yb * blockwidth + xb];
-            for (int yf = 0; yf < 8; ++yf) {
-                for (int xf = 0; xf < 8; ++xf) {
-                    float vfactor = 0;
-                    float dxfactor = 0;
-                    float dyfactor = 0;
-                    for (int yt = 0; yt < 8; ++yt) {
-                        for (int xt = 0; xt < 8; ++xt) {
-                            float xform = HaarFactor(xf, xt) * HaarFactor(yf, yt);
-                            float dx = rx - xt;
-                            float dy = ry - yt;
-                            vfactor += xform * SupportKernel(dx) * SupportKernel(dy);
-                            dxfactor += xform * SupportIntegral(dx) * SupportKernel(dy);
-                            dyfactor += xform * SupportKernel(dx) * SupportIntegral(dy);
-                        }
-                    }
-                    FDisp value;
-                    if (xf == 0) {
-                        if (yf == 0) {
-                            value = vfactor * vfull;
-                        } else {
-                            value = vfactor * vpart + invheight * dyfactor * dvdy;
-                        }
-                    } else {
-                        if (yf == 0) {
-                            value = vfactor * vpart - invwidth * dxfactor * dvdx;
-                        } else {
-                            __m128 xweight = _mm_add_ps(_mm_mul_ps(dvdx.m, dvdx.m), _mm_set_ps1(0.01f));
-                            __m128 yweight = _mm_add_ps(_mm_mul_ps(dvdy.m, dvdy.m), _mm_set_ps1(0.01f));
-                            __m128 den = _mm_rcp_ps(_mm_add_ps(xweight, yweight));
-                            xweight = _mm_mul_ps(xweight, den);
-                            yweight = _mm_mul_ps(yweight, den);
-                            FDisp dvdxw = FDisp{ _mm_mul_ps(xweight, dvdx.m) };
-                            FDisp dvdyw = FDisp{ _mm_mul_ps(yweight, dvdy.m) };
-                            value = vfactor * vpart - invwidth * dxfactor * dvdxw + invheight * dyfactor * dvdyw;
-                        }
-                    }
-                    float a, b, c;
-                    value.unpack(a, b, c);
-                    block[yf * 8 + xf][0] += a;
-                    block[yf * 8 + xf][1] += b;
-                    block[yf * 8 + xf][2] += c;
-                }
-            }
+    for (int ty = miny; ty < maxy; ++ty) {
+        for (int tx = minx; tx < maxx; ++tx) {
+            float dx = x - tx;
+            float dy = y - ty;
+            float vffactor = KernelP(dx) * KernelP(dy);
+            float vpfactor = KernelA(dx) * KernelA(dy);
+            float dxfactor = KernelB(dx) * KernelA(dy);
+            float dyfactor = KernelA(dx) * KernelB(dy);
+            __m128 xweight = _mm_add_ps(_mm_mul_ps(dvdx.m, dvdx.m), _mm_set_ps1(0.01f));
+            __m128 yweight = _mm_add_ps(_mm_mul_ps(dvdy.m, dvdy.m), _mm_set_ps1(0.01f));
+            __m128 den = _mm_rcp_ps(_mm_add_ps(xweight, yweight));
+            xweight = _mm_mul_ps(xweight, den);
+            yweight = _mm_mul_ps(yweight, den);
+            FDisp dvdxw = FDisp{ _mm_mul_ps(xweight, dvdx.m) };
+            FDisp dvdyw = FDisp{ _mm_mul_ps(yweight, dvdy.m) };
+            FDisp value = vffactor * vpart + vpfactor * (vfull - vpart) - invwidth * dxfactor * dvdxw + invheight * dyfactor * dvdyw;
+            float a, b, c;
+            value.unpack(a, b, c);
+            frames[currentframe][ty * width + tx][0] += a;
+            frames[currentframe][ty * width + tx][1] += b;
+            frames[currentframe][ty * width + tx][2] += c;
         }
     }
 }
@@ -267,10 +221,8 @@ SamplerBase::SamplerBase(int width, int height)
     , height(height)
     , perf{ traceperf.samples, sampleperf.samples }
 {
-    blockwidth = (width + 7) / 8;
-    blockheight = (height + 7) / 8;
     for (int p = 0; p < FrameCount; ++p) {
-        frames[p].resize(blockwidth * blockheight, FrameBlock{});
+        frames[p].resize(width * height, FramePixel{});
     }
     denominator = 0;
     currentframe = 0;
@@ -300,23 +252,10 @@ FDisp SamplerBase::GetValue(int x, int y)
         double a = 0;
         double b = 0;
         double c = 0;
-        int xb = x / 8;
-        int yb = y / 8;
-        int xt = x - xb * 8;
-        int yt = y - yb * 8;
         for (int p = 0; p < FrameCount; ++p) {
-            FrameBlock& block = frames[p][yb * blockwidth + xb];
-            for (int xf = 0; xf < 8; ++xf) {
-                for (int yf = 0; yf < 8; ++yf) {
-                    float factor = HaarFactor(xf, xt) * HaarFactor(yf, yt);
-                    if (xf + yf != 1) {
-                        //continue;
-                    }
-                    a += factor * block[yf * 8 + xf][0];
-                    b += factor * block[yf * 8 + xf][1];
-                    c += factor * block[yf * 8 + xf][2];
-                }
-            }
+            a += frames[p][y * width + x][0];
+            b += frames[p][y * width + x][1];
+            c += frames[p][y * width + x][2];
         }
         a /= denominator;
         b /= denominator;
@@ -333,16 +272,14 @@ SamplerBase::PerfInfo const& SamplerBase::GetPerfInfo()
     perf.sampleTime = sampleperf.Time();
     if (denominator > 0) {
         double errorsqr = 0;
-        for (int b = 0; b < blockwidth * blockheight; ++b) {
+        for (int xy = 0; xy < width * height; ++xy) {
             for (int c = 0; c < 3; ++c) {
                 double sum = 0;
                 double sumsqr = 0;
                 for (int p = 0; p < FrameCount; ++p) {
-                    for (int f = 0; f < 64; ++f) {
-                        double value = frames[p][b][f][c] / denominator;
-                        sum += value;
-                        sumsqr += value * value;
-                    }
+                    double value = frames[p][xy][c] / denominator;
+                    sum += value;
+                    sumsqr += value * value;
                 }
                 double avg = sum;
                 double avgsqr = sumsqr * FrameCount;

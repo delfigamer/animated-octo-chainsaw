@@ -24,7 +24,7 @@ ParameterSampler::~ParameterSampler()
 
 void ParameterSampler::IteratePixel(int ix, int iy)
 {
-    float passrate = 1;
+    float passrate = 1.0f / 128;
     if (!RandomBool(passrate)) {
         return;
     }
@@ -48,7 +48,7 @@ void ParameterSampler::IteratePixel(int ix, int iy)
         c = 1 - a - b;
         FDisp kav = FDisp{ scene[tr.face].mtw.xdual() };
         FDisp kbv = FDisp{ scene[tr.face].mtw.ydual() };
-        float p = 30;
+        float p = 100;
         float kea = expf(-p * a);
         float keb = expf(-p * b);
         float kec = expf(-p * c);
@@ -100,9 +100,9 @@ void ParameterSampler::IteratePixel(int ix, int iy)
         }
         RecordToFrame(
             ix + dx, iy + dy,
-            0.2f / passrate * FDisp{ fluxa, fluxb, fluxc },
-            0.2f / passrate * (1 - k) * FDisp{ fluxa, fluxb, fluxc },
-            0.4f / passrate * camera.utan * FDisp{ rua, rub, ruc },
-            0.4f / passrate * camera.vtan * FDisp{ rva, rvb, rvc });
+            0.1f / passrate * FDisp{ fluxa, fluxb, fluxc },
+            0.1f / passrate * (1 - k) * FDisp{ fluxa, fluxb, fluxc },
+            0.2f / passrate * camera.utan * FDisp{ rua, rub, ruc },
+            0.2f / passrate * camera.vtan * FDisp{ rva, rvb, rvc });
     }
 }

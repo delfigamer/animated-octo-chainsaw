@@ -21,7 +21,7 @@ protected:
         int64_t Time();
     };
 
-    using FrameBlock = std::array<std::array<double, 3>, 64>;
+    using FramePixel = std::array<double, 3>;
 
 public:
     struct PerfInfo
@@ -36,11 +36,9 @@ public:
 protected:
     int width;
     int height;
-    int blockwidth;
-    int blockheight;
     Geometry scene;
     std::mt19937 rand;
-    std::array<std::vector<FrameBlock>, FrameCount> frames;
+    std::array<std::vector<FramePixel>, FrameCount> frames;
     int currentframe;
     double denominator;
     PerfCounter traceperf;
@@ -54,8 +52,9 @@ protected:
     bool RandomBool(float beta);
     bool Trace(TraceRequest& tr);
     bool TestVisible(FPoint from, FPoint to);
-    float SupportKernel(float x);
-    float SupportIntegral(float x);
+    float KernelP(float x);
+    float KernelA(float x);
+    float KernelB(float x);
     void RecordToFrame(float x, float y, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy);
 
 public:
