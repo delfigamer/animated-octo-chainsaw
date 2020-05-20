@@ -12,7 +12,7 @@ static bool IsImportantIndex(int index)
 {
     switch (index) {
     case 256:
-        return true;
+        return false;
     default:
         return false;
     }
@@ -41,10 +41,43 @@ static float Clamp(float x)
     return x;
 }
 
+static void Tonemap(FDisp value, uint8_t* pixel)
+{
+    float ta, tb, tc;
+    if (true) {
+        float va, vb, vc;
+        value.unpack(va, vb, vc);
+        ta = 1.0f - expf(-va);
+        tb = 1.0f - expf(-vb);
+        tc = 1.0f - expf(-vc);
+    } else {
+        float l = luma(value);
+        ta = 0;
+        tb = 0;
+        tc = 0;
+        if (l > 0) {
+            tc = 1.0f - expf(-l);
+        } else {
+            ta = 1.0f - expf(l);
+        }
+    }
+    ta = fminf(fmaxf(ta, 0), 1);
+    tb = fminf(fmaxf(tb, 0), 1);
+    tc = fminf(fmaxf(tc, 0), 1);
+    int ba = (int)(sqrtf(ta) * 255.0f);
+    int bb = (int)(sqrtf(tb) * 255.0f);
+    int bc = (int)(sqrtf(tc) * 255.0f);
+    pixel[0] = bc;
+    pixel[1] = bb;
+    pixel[2] = ba;
+    pixel[3] = 255;
+}
+
 void RendererThread::ThreadFunc()
 {
-    std::unique_ptr<SamplerBase> pintegrator{ new BidirSampler(width, height) };
+    //std::unique_ptr<SamplerBase> pintegrator{ new BidirSampler(width, height) };
     //std::unique_ptr<SamplerBase> pintegrator{ new ForwardSampler(width, height) };
+    std::unique_ptr<SamplerBase> pintegrator{ new ParameterSampler(width, height) };
     int64_t time = GetTickCount64();
     int iterindex = 0;
     while (!rterminate.load(std::memory_order_relaxed)) {
@@ -65,29 +98,7 @@ void RendererThread::ThreadFunc()
                 for (int ix = 0; ix < width; ++ix) {
                     uint8_t* pixel = line + ix * 4;
                     FDisp value = exposure * pintegrator->GetValue(ix, iy);
-                    /*
-                    float l = luma(value);
-                    float tl = 1.0f - expf(-l);
-                    value *= tl / l;
-                    float va, vb, vc;
-                    value.unpack(va, vb, vc);
-                    float ta = Clamp(va);
-                    float tb = Clamp(vb);
-                    float tc = Clamp(vc);
-                    */
-                    float va, vb, vc;
-                    value.unpack(va, vb, vc);
-                    float ta = 1.0f - expf(-va);
-                    float tb = 1.0f - expf(-vb);
-                    float tc = 1.0f - expf(-vc);
-                    
-                    int ba = (int)(sqrtf(ta) * 255.0f);
-                    int bb = (int)(sqrtf(tb) * 255.0f);
-                    int bc = (int)(sqrtf(tc) * 255.0f);
-                    pixel[0] = bc;
-                    pixel[1] = bb;
-                    pixel[2] = ba;
-                    pixel[3] = 255;
+                    Tonemap(value, pixel);
                 }
             }
             auto& perf = pintegrator->GetPerfInfo();

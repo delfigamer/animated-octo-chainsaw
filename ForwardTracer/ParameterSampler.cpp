@@ -13,8 +13,8 @@ ParameterSampler::ParameterSampler(int width, int height)
         1.0f * sqrtf(aspect), 1.0f / sqrtf(aspect));*/
     scene.LoadFromT3D("D:\\Program Files (x86)\\Unreal Tournament GOTY\\Maps\\Box.t3d");
     camera = Camera::Targeted(
-        FPoint{ -170, 140, 230 },
-        FPoint{ 0, -20, 50 },
+        FPoint{ -130, -140, 150 },
+        FPoint{ -10, 0, 120 },
         1.0f * sqrtf(aspect), 1.0f / sqrtf(aspect));
 }
 
@@ -24,6 +24,10 @@ ParameterSampler::~ParameterSampler()
 
 void ParameterSampler::IteratePixel(int ix, int iy)
 {
+    float passrate = 1;
+    if (!RandomBool(passrate)) {
+        return;
+    }
     float dx;
     float dy;
     GenerateTriangle(dx);
@@ -35,23 +39,70 @@ void ParameterSampler::IteratePixel(int ix, int iy)
     TraceRequest tr;
     tr.origin = camera.mwc.origin();
     tr.dir = norm(camera.mwc * FDisp{ cu, cv, 1.0f });
-    FDisp current = FDisp{ 0, 0, 0 };
-    float factor = 1;
-    while (Trace(tr)) {
-        float texu = dot(tr.hit, scene[tr.face].texu);
-        float texv = dot(tr.hit, scene[tr.face].texv);
-        // FDisp tc = scene.SampleColor(scene[tr.face].diffusetex, texu, texv);
-        FDisp tc;
-        if (tr.side == 0) {
-            tc = FDisp{ 0, 1, 0 };
-        } else if (tr.side == 1) {
-            tc = FDisp{ 0, 0, 1 };
-        } else {
-            tc = FDisp{ 1, 0, 0 };
+    if (Trace(tr)) {
+        FPoint chit = camera.mcw * tr.hit;
+        float chx, chy, chz;
+        chit.unpack(chx, chy, chz);
+        float a, b, c;
+        tr.hitlocal.unpack(a, b, c);
+        c = 1 - a - b;
+        FDisp kav = FDisp{ scene[tr.face].mtw.xdual() };
+        FDisp kbv = FDisp{ scene[tr.face].mtw.ydual() };
+        float p = 30;
+        float kea = expf(-p * a);
+        float keb = expf(-p * b);
+        float kec = expf(-p * c);
+        float k = (1 - kea) * (1 - keb) * (1 - kec);
+        float kda = p * kea * (1 - keb) * (1 - kec);
+        float kdb = p * (1 - kea) * keb * (1 - kec);
+        float kdc = p * (1 - kea) * (1 - keb) * kec;
+        FDisp kgrad = (kda - kdc) * kav + (kdb - kdc) * kbv;
+        FDisp d = tr.hit - camera.mwc.origin();
+        FDisp norm = scene[tr.face].mwt.zunit();
+        float fluxa, fluxb, fluxc;
+        float rua, rub, ruc;
+        float rva, rvb, rvc;
+        {
+            float flux = a;
+            FDisp fluxgrad = kav;
+            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
+            FDisp radialcam = camera.mcw * radialgrad;
+            float rdx, rdy, rdz;
+            radialcam.unpack(rdx, rdy, rdz);
+            float ru = rdx * chz;
+            float rv = rdy * chz;
+            fluxa = flux; rua = ru; rva = rv;
         }
-        current += tc * factor;
-        factor *= 0.5f;
-        tr.origin = tr.hit;
+        {
+            float flux = b;
+            FDisp fluxgrad = kbv;
+            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
+            FDisp radialcam = camera.mcw * radialgrad;
+            float rdx, rdy, rdz;
+            radialcam.unpack(rdx, rdy, rdz);
+            float ru = rdx * chz;
+            float rv = rdy * chz;
+            fluxb = flux; rub = ru; rvb = rv;
+        }
+        {
+            float flux = c;
+            FDisp fluxgrad = - kav - kbv;
+            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
+            FDisp radialcam = camera.mcw * radialgrad;
+            float rdx, rdy, rdz;
+            radialcam.unpack(rdx, rdy, rdz);
+            float ru = rdx * chz;
+            float rv = rdy * chz;
+            fluxc = flux; ruc = ru; rvc = rv;
+        }
+        RecordToFrame(
+            ix + dx, iy + dy,
+            0.2f / passrate * FDisp{ fluxa, fluxb, fluxc },
+            0.2f / passrate * (1 - k) * FDisp{ fluxa, fluxb, fluxc },
+            0.4f / passrate * camera.utan * FDisp{ rua, rub, ruc },
+            0.4f / passrate * camera.vtan * FDisp{ rva, rvb, rvc });
     }
-    RecordToFrame(ix, iy, 0.2f * current);
 }

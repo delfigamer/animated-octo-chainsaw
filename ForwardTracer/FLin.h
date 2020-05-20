@@ -39,7 +39,7 @@ struct FXmmQuad
 
     FXmmQuad() = default;
 
-    FXmmQuad(__m128 mm)
+    explicit FXmmQuad(__m128 mm)
         : m(mm)
     {
     }
@@ -75,7 +75,7 @@ struct FPoint: FXmmQuad
 {
     FPoint() = default;
 
-    FPoint(__m128 mm)
+    explicit FPoint(__m128 mm)
         : FXmmQuad(mm)
     {
     }
@@ -90,7 +90,7 @@ struct FDisp: FXmmQuad
 {
     FDisp() = default;
 
-    FDisp(__m128 mm)
+    explicit FDisp(__m128 mm)
         : FXmmQuad(mm)
     {
     }
@@ -98,6 +98,11 @@ struct FDisp: FXmmQuad
     FDisp(float x, float y, float z)
         : FXmmQuad(x, y, z, 0)
     {
+    }
+
+    explicit FDisp(FXmmQuad q)
+    {
+        m = _mm_mul_ps(q.m, _mm_setr_ps(1, 1, 1, 0));
     }
 };
 
@@ -172,6 +177,21 @@ struct FMat
                 wp->m = _mm_movehl_ps(td, tc);
             }
         }
+    }
+
+    FXmmQuad xdual() const
+    {
+        return FXmmQuad{ ma };
+    }
+
+    FXmmQuad ydual() const
+    {
+        return FXmmQuad{ mb };
+    }
+
+    FXmmQuad zdual() const
+    {
+        return FXmmQuad{ mc };
     }
 
     FDisp xunit() const

@@ -340,6 +340,7 @@ bool Geometry::Trace(TraceRequest& tr)
         }
         tr.param = tparam;
         tr.hit = tr.origin + tr.dir * tparam;
+        tr.hitlocal = thit;
         tr.face = i;
         if (toz >= 0) {
             tr.side = 1;

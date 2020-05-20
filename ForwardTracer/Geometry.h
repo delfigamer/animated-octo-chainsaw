@@ -34,6 +34,7 @@ struct TraceRequest
 // output
     float param;
     FPoint hit;
+    FPoint hitlocal;
     int face;
     int side;
 };
