@@ -24,7 +24,8 @@ ParameterSampler::~ParameterSampler()
 
 void ParameterSampler::IteratePixel(int ix, int iy)
 {
-    if (!RandomBool(1.0f / 1)) {
+    float globalpassrate = 1.0f / 1;
+    if (!RandomBool(globalpassrate)) {
         return;
     }
     float dx;
@@ -61,16 +62,20 @@ void ParameterSampler::IteratePixel(int ix, int iy)
         edgedistgrad -= dot(edgedistgrad, norm) * norm;
         float k = edgedist;
         FDisp kgrad = edgedistgrad;
+        //k = 1;
+        //kgrad = FDisp{ 0, 0, 0 };
         float passrate = fmaxf(1.0f / 256, (1 - k) * (1 - k));
         if (!RandomBool(passrate)) {
             return;
         }
-        passrate /= 1;
+        passrate *= globalpassrate;
         float flux;
         FDisp fluxgrad;
         {
             flux = a;
             fluxgrad = kav;
+            //flux = sinf(100 * a) * 0.5f + 0.5f;
+            //fluxgrad = 50 * kav * cosf(100 * a);
             FDisp finalgrad = - flux * kgrad + k * fluxgrad;
             FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
             FDisp radialcam = camera.mcw * radialgrad;
@@ -104,6 +109,9 @@ void ParameterSampler::IteratePixel(int ix, int iy)
             float rv = -rdy * chz;
             fluxc = flux; ruc = ru; rvc = rv;
         }
+        //fluxb = fluxc = fluxa;
+        //rub = ruc = rua;
+        //rvb = rvc = rva;
         float invk = 1 - k;
         RecordToFrame(
             ix + dx, iy + dy,

@@ -25,22 +25,10 @@ protected:
 
     struct Kernel
     {
-        /*int size;
-        float outerradius;
-        float outerradiussqr;
-        float limit;
-        float innerradiussqr;
-        float outerfactor;
-        float outeroffset;*/
-        int size;
-        float outerradius;
-        float outerradiussqr;
-        float outerscale;
-        float innerscale;
+        float width;
 
-        Kernel(float radius);
-
-        bool operator()(float dx, float dy, float& basew, float& extw, float& dxw, float& dyw);
+        Kernel(float width);
+        void Sample(float q, float& r, float& d, float& dl);
     };
 
 public:
@@ -58,6 +46,7 @@ protected:
     int height;
     Geometry scene;
     Kernel pixelkernel;
+    Kernel extendkernel;
     std::mt19937 rand;
     std::array<std::vector<FramePixel>, FrameCount> frames;
     std::array<std::vector<double>, FrameCount> frameden;

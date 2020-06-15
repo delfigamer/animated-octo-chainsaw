@@ -32,85 +32,25 @@ int64_t SamplerBase::PerfCounter::Time()
     }
 }
 
-SamplerBase::Kernel::Kernel(float radius)
+SamplerBase::Kernel::Kernel(float width)
+    : width(width)
 {
-    float c = 0.9549297f; // 3 / Pi
-    if (radius < 2) {
-        radius = 2;
-    }
-    size = (int)ceilf(radius);
-    outerradius = radius;
-    outerradiussqr = radius * radius;
-    outerscale = c / (radius * radius * radius);
 }
 
-bool SamplerBase::Kernel::operator()(float dx, float dy, float& basew, float& extw, float& dxw, float& dyw)
+void SamplerBase::Kernel::Sample(float q, float& r, float& d, float& dl)
 {
-    float c = 0.9549297f; // 3 / Pi
-    float e = 0.1591549f; // 1 / (2 Pi)
-    float rsqr = dx * dx + dy * dy;
-    if (rsqr >= outerradiussqr) {
-        return false;
+    float const pi = 3.141593f;
+    float nr = -logf(q);
+    r = width * nr;
+    d = (nr + 1) / (2*pi * r * r);
+    if (!isfinite(r)) {
+        r = 1e-6f;
     }
-    float r = sqrtf(rsqr);
-    basew = fmaxf(0, c * (1 - r));
-    extw = outerscale * (outerradius - r) - basew;
-    float h;
-    if (basew == 0) {
-        h = - e / rsqr;
-    } else {
-        h = - c * (0.5f - (1.0f / 3) * r);
+    if (!isfinite(d)) {
+        d = 1e6f;
     }
-    h += outerscale * (0.5f * outerradius - (1.0f / 3) * r);
-    dxw = dx * h;
-    dyw = dy * h;
-    return true;
+    dl = d * width;
 }
-
-/*
-SamplerBase::Kernel::Kernel(float radius)
-{
-    if (radius < 2) {
-        radius = 2;
-    }
-    size = (int)ceilf(radius);
-    outerradius = radius;
-    outerradiussqr = radius * radius;
-    {
-        double b = 3 - 3 * outerradiussqr;
-        double x = 1 / outerradiussqr;
-        x -= (((x + 3) * x + b) * x + 1) / ((3 * x + 6) * x + b);
-        x -= (((x + 3) * x + b) * x + 1) / ((3 * x + 6) * x + b);
-        x -= (((x + 3) * x + b) * x + 1) / ((3 * x + 6) * x + b);
-        limit = (float)x;
-        innerradiussqr = (float)(x * x + 2 * x + 1);
-    }
-    outerfactor = innerradiussqr * (limit + 1) / 6;
-    outeroffset = limit / 2;
-}
-
-bool SamplerBase::Kernel::operator()(float dx, float dy, float& basew, float& extw, float& dxw, float& dyw)
-{
-    float c = 0.9549297f; // 3 / Pi
-    float rsqr = dx * dx + dy * dy;
-    float h;
-    if (rsqr >= outerradiussqr) {
-        return false;
-    }
-    float r = sqrtf(rsqr);
-    basew = fmaxf(0, c * (1 - r));
-    if (rsqr >= innerradiussqr) {
-        extw = 0.5f * c * limit;
-        h = 0.5f * c * (outeroffset - outerfactor / rsqr);
-    } else {
-        extw = 0.5f * c * (r - 1);
-        h = 0.5f * c * (-0.5f + (1.0f / 3) * r);
-    }
-    dxw = dx * h;
-    dyw = dy * h;
-    return true;
-}
-*/
 
 void SamplerBase::GenerateUniform(float& q)
 {
@@ -191,98 +131,6 @@ bool SamplerBase::TestVisible(FPoint from, FPoint to)
     return r;
 }
 
-/*float SamplerBase::KernelP(float d)
-{
-    if (d < -1) {
-        return 0;
-    } else if (d < 0) {
-        return 1 + d;
-    } else if (d < 1) {
-        return 1 - d;
-    } else {
-        return 0;
-    }
-}
-
-static constexpr int kernelwidth = 5;
-
-float SamplerBase::KernelA(float d)
-{
-    if (true) {
-        if (d < -5) {
-            return 0;
-        } else if (d < -4) {
-            return (1.0f / 9) * (5 + d);
-        } else if (d < 4) {
-            return (1.0f / 9);
-        } else if (d < 5) {
-            return (1.0f / 9) * (5 - d);
-        } else {
-            return 0;
-        }
-    } else {
-        float x = d * (3.0f / kernelwidth);
-        float w;
-        if (x < -3) {
-            w = 0;
-        } else if (x < 3) {
-            float x2 = x * x;
-            w = (((-1.445588e-4f * x2 + 3.828830e-3f) * x2 - 3.929046e-2f) * x2 + 1.936532e-1f) * x2 - 4.044683e-1f;
-        } else {
-            w = 0;
-        }
-        return w * (3.0f / kernelwidth);
-    }
-}
-
-float SamplerBase::KernelB(float d)
-{
-    if (true) {
-        if (d < -5) {
-            return 0;
-        } else if (d < -4) {
-            float t = 5 + d;
-            return -(1.0f / 18) * t * t;
-        } else if (d < -1) {
-            return -(1.0f / 9) * (4.5f + d);
-        } else if (d < 0) {
-            return (1.0f / 2) * d * (16 / 9.0f + d);
-        } else if (d < 1) {
-            return -(1.0f / 2) * d * (-16 / 9.0f + d);
-        } else if (d < 4) {
-            return (1.0f / 9) * (4.5f - d);
-        } else if (d < 5) {
-            float t = -5 + d;
-            return (1.0f / 18) * t * t;
-        } else {
-            return 0;
-        }
-    } else {
-        float x = d * (3.0f / kernelwidth);
-        float wi;
-        if (x < -3) {
-            wi = 0.5f;
-        } else if (x < 3) {
-            float x2 = x * x;
-            wi = ((((-1.606209e-5f * x2 + 5.469757e-4f) * x2 - 7.858093e-3f) * x2 + 6.455106e-2f) * x2 - 4.044683e-1f) * x;
-        } else {
-            wi = -0.5f;
-        }
-        if (d < 1) {
-            wi += -0.5f;
-        } else if (d < 0) {
-            float sd = d + 1;
-            wi += 0.5f * sd * sd - 0.5f;
-        } else if (d < 1) {
-            float sd = d - 1;
-            wi += -0.5f * sd * sd + 0.5f;
-        } else {
-            wi += 0.5f;
-        }
-        return wi;
-    }
-}*/
-
 static int Clip(int x, int min, int max)
 {
     if (x < min) {
@@ -306,26 +154,54 @@ static int Ceil(float x)
 
 void SamplerBase::RecordToFrame(float x, float y, float wfull, float wpart, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy)
 {
-    int minx = Clip(Floor(x - pixelkernel.size), 0, width);
-    int maxx = Clip(Ceil(x + pixelkernel.size + 1), 0, width);
-    int miny = Clip(Floor(y - pixelkernel.size), 0, height);
-    int maxy = Clip(Ceil(y + pixelkernel.size + 1), 0, height);
+    float q;
+    float pr, pd, pdl;
+    float er, ed, edl;
+    pr = -1;
+    //while (pr < 0.1f) {
+        GenerateUniform(q);
+        pixelkernel.Sample(q, pr, pd, pdl);
+        extendkernel.Sample(q, er, ed, edl);
+    //}
+    float ersqr = er * er;
+    int minx = Clip(Floor(x - er), 0, width);
+    int maxx = Clip(Ceil(x + er + 1), 0, width);
+    int miny = Clip(Floor(y - er), 0, height);
+    int maxy = Clip(Ceil(y + er + 1), 0, height);
     float invwidth = 1.0f / width;
     float invheight = 1.0f / height;
     for (int ty = miny; ty < maxy; ++ty) {
         for (int tx = minx; tx < maxx; ++tx) {
-            float basew, extw, dxw, dyw;
-            if (!pixelkernel(x - tx, y - ty, basew, extw, dxw, dyw)) {
+            float dx = tx - x;
+            float dy = ty - y;
+            float drsqr = dx * dx + dy * dy;
+            if (drsqr > ersqr) {
                 continue;
             }
-            FDisp value = basew * vfull + extw * vpart + invwidth * dxw * dvdx + invheight * dyw * dvdy;
-            //value -= vffactor * vfull;
+            float dr = sqrtf(drsqr);
+            if (!isfinite(dr)) {
+                dr = 1e-6f;
+            }
+            FDisp value;
+            if (dr < pr) {
+                float gradw = edl - pdl;
+                float dxw = gradw * dx / dr;
+                float dyw = gradw * dy / dr;
+                value = pd * vfull + (ed - pd) * vpart + invwidth * dxw * dvdx + invheight * dyw * dvdy;
+            } else {
+                float dxw = edl * dx / dr;
+                float dyw = edl * dy / dr;
+                value = ed * vpart + invwidth * dxw * dvdx + invheight * dyw * dvdy;
+            }
+            if (dr < pr) {
+                //value -= pd * vfull;
+            }
             float a, b, c;
             value.unpack(a, b, c);
             frames[currentframe][ty * width + tx][0] += a;
             frames[currentframe][ty * width + tx][1] += b;
             frames[currentframe][ty * width + tx][2] += c;
-            frameden[currentframe][ty * width + tx] += (basew + extw) * wfull;
+            frameden[currentframe][ty * width + tx] += ed * wfull;
         }
     }
 }
@@ -333,7 +209,8 @@ void SamplerBase::RecordToFrame(float x, float y, float wfull, float wpart, FDis
 SamplerBase::SamplerBase(int width, int height)
     : width(width)
     , height(height)
-    , pixelkernel(5)
+    , pixelkernel(1)
+    , extendkernel(5)
     , perf{ traceperf.samples, sampleperf.samples }
 {
     for (int p = 0; p < FrameCount; ++p) {
@@ -351,8 +228,8 @@ SamplerBase::~SamplerBase()
 void SamplerBase::Iterate()
 {
     denominator += 1;
-    for (int iy = -pixelkernel.size; iy < height + pixelkernel.size; ++iy) {
-        for (int ix = -pixelkernel.size; ix < width + pixelkernel.size; ++ix) {
+    for (int iy = 0; iy < height; ++iy) {
+        for (int ix = 0; ix < width; ++ix) {
             int64_t time;
             sampleperf.SampleStart(time);
             IteratePixel(ix, iy);
