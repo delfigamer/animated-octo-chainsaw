@@ -23,6 +23,26 @@ protected:
 
     using FramePixel = std::array<double, 3>;
 
+    struct Kernel
+    {
+        /*int size;
+        float outerradius;
+        float outerradiussqr;
+        float limit;
+        float innerradiussqr;
+        float outerfactor;
+        float outeroffset;*/
+        int size;
+        float outerradius;
+        float outerradiussqr;
+        float outerscale;
+        float innerscale;
+
+        Kernel(float radius);
+
+        bool operator()(float dx, float dy, float& basew, float& extw, float& dxw, float& dyw);
+    };
+
 public:
     struct PerfInfo
     {
@@ -37,8 +57,10 @@ protected:
     int width;
     int height;
     Geometry scene;
+    Kernel pixelkernel;
     std::mt19937 rand;
     std::array<std::vector<FramePixel>, FrameCount> frames;
+    std::array<std::vector<double>, FrameCount> frameden;
     int currentframe;
     double denominator;
     PerfCounter traceperf;
@@ -52,10 +74,7 @@ protected:
     bool RandomBool(float beta);
     bool Trace(TraceRequest& tr);
     bool TestVisible(FPoint from, FPoint to);
-    float KernelP(float x);
-    float KernelA(float x);
-    float KernelB(float x);
-    void RecordToFrame(float x, float y, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy);
+    void RecordToFrame(float x, float y, float wfull, float wpart, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy);
 
 public:
     SamplerBase(int width, int height);

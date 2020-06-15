@@ -24,8 +24,7 @@ ParameterSampler::~ParameterSampler()
 
 void ParameterSampler::IteratePixel(int ix, int iy)
 {
-    float passrate = 1.0f / 128;
-    if (!RandomBool(passrate)) {
+    if (!RandomBool(1.0f / 1)) {
         return;
     }
     float dx;
@@ -48,60 +47,69 @@ void ParameterSampler::IteratePixel(int ix, int iy)
         c = 1 - a - b;
         FDisp kav = FDisp{ scene[tr.face].mtw.xdual() };
         FDisp kbv = FDisp{ scene[tr.face].mtw.ydual() };
-        float p = 100;
-        float kea = expf(-p * a);
-        float keb = expf(-p * b);
-        float kec = expf(-p * c);
-        float k = (1 - kea) * (1 - keb) * (1 - kec);
-        float kda = p * kea * (1 - keb) * (1 - kec);
-        float kdb = p * (1 - kea) * keb * (1 - kec);
-        float kdc = p * (1 - kea) * (1 - keb) * kec;
-        FDisp kgrad = (kda - kdc) * kav + (kdb - kdc) * kbv;
         FDisp d = tr.hit - camera.mwc.origin();
         FDisp norm = scene[tr.face].mwt.zunit();
         float fluxa, fluxb, fluxc;
         float rua, rub, ruc;
         float rva, rvb, rvc;
+        float edgesqr;
+        FDisp edgesqrgrad;
+        scene.EdgeDistance(camera.mwc.origin(), d, edgesqr, edgesqrgrad);
+        float p = 0.1f;
+        float edgedist = 1 - expf(-p * edgesqr);
+        FDisp edgedistgrad = -p * expf(-p * edgesqr) * edgesqrgrad;
+        edgedistgrad -= dot(edgedistgrad, norm) * norm;
+        float k = edgedist;
+        FDisp kgrad = edgedistgrad;
+        float passrate = fmaxf(1.0f / 256, (1 - k) * (1 - k));
+        if (!RandomBool(passrate)) {
+            return;
+        }
+        passrate /= 1;
+        float flux;
+        FDisp fluxgrad;
         {
-            float flux = a;
-            FDisp fluxgrad = kav;
-            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            flux = a;
+            fluxgrad = kav;
+            FDisp finalgrad = - flux * kgrad + k * fluxgrad;
             FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
             FDisp radialcam = camera.mcw * radialgrad;
             float rdx, rdy, rdz;
             radialcam.unpack(rdx, rdy, rdz);
             float ru = rdx * chz;
-            float rv = rdy * chz;
+            float rv = -rdy * chz;
             fluxa = flux; rua = ru; rva = rv;
         }
         {
-            float flux = b;
-            FDisp fluxgrad = kbv;
-            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            flux = b;
+            fluxgrad = kbv;
+            FDisp finalgrad = - flux * kgrad + k * fluxgrad;
             FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
             FDisp radialcam = camera.mcw * radialgrad;
             float rdx, rdy, rdz;
             radialcam.unpack(rdx, rdy, rdz);
             float ru = rdx * chz;
-            float rv = rdy * chz;
+            float rv = -rdy * chz;
             fluxb = flux; rub = ru; rvb = rv;
         }
         {
-            float flux = c;
-            FDisp fluxgrad = - kav - kbv;
-            FDisp finalgrad = flux * kgrad + k * fluxgrad;
+            flux = 1 - a - b;
+            fluxgrad = -kav - kbv;
+            FDisp finalgrad = - flux * kgrad + k * fluxgrad;
             FDisp radialgrad = finalgrad - (dot(d, finalgrad) / dot(d, norm)) * norm;
             FDisp radialcam = camera.mcw * radialgrad;
             float rdx, rdy, rdz;
             radialcam.unpack(rdx, rdy, rdz);
             float ru = rdx * chz;
-            float rv = rdy * chz;
+            float rv = -rdy * chz;
             fluxc = flux; ruc = ru; rvc = rv;
         }
+        float invk = 1 - k;
         RecordToFrame(
             ix + dx, iy + dy,
+            1 / passrate, 0,
             0.1f / passrate * FDisp{ fluxa, fluxb, fluxc },
-            0.1f / passrate * (1 - k) * FDisp{ fluxa, fluxb, fluxc },
+            0.1f / passrate * k * FDisp{ fluxa, fluxb, fluxc },
             0.2f / passrate * camera.utan * FDisp{ rua, rub, ruc },
             0.2f / passrate * camera.vtan * FDisp{ rva, rvb, rvc });
     }

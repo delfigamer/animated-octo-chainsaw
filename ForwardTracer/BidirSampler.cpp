@@ -529,7 +529,7 @@ void BidirSampler::RecordContribution(FDisp dir, FDisp value)
     float cy = cv / camera.vtan;
     float nx = 0.5f * (1.0f + cx) * width - 0.5f;
     float ny = 0.5f * (1.0f - cy) * height - 0.5f;
-    RecordToFrame(nx, ny, value, value, FDisp{ 0, 0, 0 }, FDisp{ 0, 0, 0 });
+    RecordToFrame(nx, ny, 1, 1, value, value, FDisp{ 0, 0, 0 }, FDisp{ 0, 0, 0 });
 }
 
 void BidirSampler::RecordPathContribution(int lightnodes, int lensnodes)

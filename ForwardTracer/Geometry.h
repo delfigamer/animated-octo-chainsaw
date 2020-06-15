@@ -26,6 +26,12 @@ struct Face
     FaceMaterial mat;
 };
 
+struct Segment
+{
+    FPoint origin;
+    FDisp delta;
+};
+
 struct TraceRequest
 {
 // input
@@ -43,6 +49,7 @@ class Geometry
 {
 private:
     std::vector<Face> faces;
+    std::vector<Segment> edges;
     std::vector<ColorTexture> textures;
 
     friend struct MatLoader;
@@ -55,6 +62,7 @@ public:
     void LoadFromT3D(char const* path);
     bool Trace(TraceRequest& tr);
     bool Test(FPoint const& origin, FDisp const& delta);
+    void EdgeDistance(FPoint const& origin, FDisp const& delta, float& dist, FDisp& grad);
 
     Face& operator[](int index);
     int FaceCount();
