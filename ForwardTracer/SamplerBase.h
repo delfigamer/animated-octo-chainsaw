@@ -63,7 +63,10 @@ protected:
     bool RandomBool(float beta);
     bool Trace(TraceRequest& tr);
     bool TestVisible(FPoint from, FPoint to);
-    void RecordToFrame(float x, float y, float wfull, float wpart, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy);
+    void RecordToFrame(
+        float x, float y, 
+        float wfull, float wpart, float dwdx, float dwdy,
+        FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy);
 
 public:
     SamplerBase(int width, int height);

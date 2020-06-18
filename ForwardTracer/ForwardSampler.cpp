@@ -50,7 +50,7 @@ void ForwardSampler::IteratePixel(int ix, int iy)
             float r = dot(emitspec, Spectrum::ResponseSpectrumR());
             float g = dot(emitspec, Spectrum::ResponseSpectrumG());
             float b = dot(emitspec, Spectrum::ResponseSpectrumB());
-            RecordToFrame((float)ix, (float)iy, 1, 1, FDisp{ r, g, b }, FDisp{ r, g, b }, FDisp{ 0, 0, 0 }, FDisp{ 0, 0, 0 });
+            RecordToFrame((float)ix, (float)iy, 1, 0, 0, 0, FDisp{ r, g, b }, FDisp{ r, g, b }, FDisp{ 0, 0, 0 }, FDisp{ 0, 0, 0 });
             //break;
         }
         FDisp normal = scene[tr.face].mwt.zunit();

@@ -152,17 +152,20 @@ static int Ceil(float x)
     return (int)ceilf(x);
 }
 
-void SamplerBase::RecordToFrame(float x, float y, float wfull, float wpart, FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy)
+void SamplerBase::RecordToFrame(
+    float x, float y,
+    float wfull, float wpart, float dwdx, float dwdy,
+    FDisp vfull, FDisp vpart, FDisp dvdx, FDisp dvdy)
 {
     float q;
     float pr, pd, pdl;
     float er, ed, edl;
     pr = -1;
-    //while (pr < 0.1f) {
+    while (pr < 0.1f) {
         GenerateUniform(q);
         pixelkernel.Sample(q, pr, pd, pdl);
         extendkernel.Sample(q, er, ed, edl);
-    //}
+    }
     float ersqr = er * er;
     int minx = Clip(Floor(x - er), 0, width);
     int maxx = Clip(Ceil(x + er + 1), 0, width);
@@ -183,15 +186,18 @@ void SamplerBase::RecordToFrame(float x, float y, float wfull, float wpart, FDis
                 dr = 1e-6f;
             }
             FDisp value;
+            float weight;
             if (dr < pr) {
                 float gradw = edl - pdl;
                 float dxw = gradw * dx / dr;
                 float dyw = gradw * dy / dr;
-                value = pd * vfull + (ed - pd) * vpart + invwidth * dxw * dvdx + invheight * dyw * dvdy;
+                value = pd * vfull + (ed - pd) * vpart - invwidth * dxw * dvdx - invheight * dyw * dvdy;
+                weight = pd * wfull + (ed - pd) * wpart - invwidth * dxw * dwdx - invheight * dyw * dwdy;
             } else {
                 float dxw = edl * dx / dr;
                 float dyw = edl * dy / dr;
-                value = ed * vpart + invwidth * dxw * dvdx + invheight * dyw * dvdy;
+                value = ed * vpart - invwidth * dxw * dvdx - invheight * dyw * dvdy;
+                weight = ed * wpart - invwidth * dxw * dwdx - invheight * dyw * dwdy;
             }
             if (dr < pr) {
                 //value -= pd * vfull;
@@ -201,7 +207,7 @@ void SamplerBase::RecordToFrame(float x, float y, float wfull, float wpart, FDis
             frames[currentframe][ty * width + tx][0] += a;
             frames[currentframe][ty * width + tx][1] += b;
             frames[currentframe][ty * width + tx][2] += c;
-            frameden[currentframe][ty * width + tx] += ed * wfull;
+            frameden[currentframe][ty * width + tx] += weight;
         }
     }
 }
@@ -210,7 +216,8 @@ SamplerBase::SamplerBase(int width, int height)
     : width(width)
     , height(height)
     , pixelkernel(1)
-    , extendkernel(5)
+    , extendkernel(10)
+    , rand(1)
     , perf{ traceperf.samples, sampleperf.samples }
 {
     for (int p = 0; p < FrameCount; ++p) {
