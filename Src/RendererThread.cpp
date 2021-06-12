@@ -98,9 +98,9 @@ void RendererThread::ThreadFunc()
             auto& bits = bitbuf.Back();
             bits.resize(width * height * 4);
             uint8_t* pixels = bits.data();
-            for (int iy = 0; iy < height; ++iy) {
+            for (intptr_t iy = 0; iy < height; ++iy) {
                 uint8_t* line = pixels + iy * width * 4;
-                for (int ix = 0; ix < width; ++ix) {
+                for (intptr_t ix = 0; ix < width; ++ix) {
                     uint8_t* pixel = line + ix * 4;
                     FDisp value = exposure * pintegrator->GetValue(ix, iy);
                     Tonemap(value, pixel);
