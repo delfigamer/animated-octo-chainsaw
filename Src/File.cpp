@@ -1,3 +1,5 @@
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "File.h"
 
 File::File(std::string const& path, char const* mode) {
