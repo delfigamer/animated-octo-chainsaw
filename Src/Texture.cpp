@@ -1,7 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "Texture.h"
-#include <png.h>
+//#include <png.h>
 #include <cmath>
 #include <cstdio>
 #include <csetjmp>
@@ -203,87 +203,87 @@ ColorTexture& ColorTexture::operator=(ColorTexture&& other)
     return *this;
 }
 
-static void texload_error_handler(png_structp png, png_const_charp msg)
-{
-    jmp_buf* buf = (jmp_buf*)png_get_error_ptr(png);
-    longjmp(*buf, 1);
-}
-
-static void texload_warning_handler(png_structp png, png_const_charp msg)
-{
-}
+//static void texload_error_handler(png_structp png, png_const_charp msg)
+//{
+//    jmp_buf* buf = (jmp_buf*)png_get_error_ptr(png);
+//    longjmp(*buf, 1);
+//}
+//
+//static void texload_warning_handler(png_structp png, png_const_charp msg)
+//{
+//}
 
 void ColorTexture::Load(char const* path)
 {
-    jmp_buf jbuf;
-    FILE* fin = fopen(path, "rb");
-    if (!fin) {
-        return;
-    }
-    png_structp png = png_create_read_struct(
-        PNG_LIBPNG_VER_STRING, &jbuf,
-        &texload_error_handler, &texload_warning_handler);
-    if (png) {
-        png_infop info = png_create_info_struct(png);
-        if (info) {
-            if (!setjmp(jbuf)) {
-                png_init_io(png, fin);
-                png_read_info(png, info);
-                png_uint_32 width;
-                png_uint_32 height;
-                int bitdepth;
-                int colortype;
-                png_get_IHDR(png, info,
-                    &width, &height,
-                    &bitdepth, &colortype, 0, 0, 0);
-                double gamma;
-                if (png_get_gAMA(png, info, &gamma)) {
-                    png_set_gamma(png, 2.2, gamma);
-                } else {
-                    png_set_gamma(png, 2.2, 0.45455);
-                }
-                if (colortype == PNG_COLOR_TYPE_PALETTE) {
-                    png_set_palette_to_rgb(png);
-                }
-                if (colortype == PNG_COLOR_TYPE_GRAY && bitdepth < 8) {
-                    png_set_expand_gray_1_2_4_to_8(png);
-                }
-                if (png_get_valid(png, info, PNG_INFO_tRNS)) {
-                    png_set_tRNS_to_alpha(png);
-                } else {
-                    int channels = png_get_channels(png, info);
-                    if (channels == 1 || channels == 3) {
-                        png_set_add_alpha(png, 255, PNG_FILLER_AFTER);
-                    }
-                }
-                if (colortype == PNG_COLOR_TYPE_GRAY ||
-                    colortype == PNG_COLOR_TYPE_GRAY_ALPHA) {
-                    png_set_gray_to_rgb(png);
-                }
-                if (bitdepth == 16) {
-                    png_set_scale_16(png);
-                }
-                png_set_interlace_handling(png);
-                png_read_update_info(png, info);
-                std::vector<uint8_t> pixels(width * height * 4, 0);
-                std::vector<uint8_t*> rowpointers(height);
-                for (unsigned y = 0; y < height; ++y) {
-                    rowpointers[y] =
-                        pixels.data() + y * width * 4;
-                }
-                png_read_image(png, (png_bytep*)rowpointers.data());
-                png_read_end(png, nullptr);
-                this->width = width;
-                this->height = height;
-                this->pixels = std::move(pixels);
-            }
-        }
-        png_destroy_read_struct(
-            &png,
-            info ? &info : nullptr,
-            nullptr);
-    }
-    fclose(fin);
+    //jmp_buf jbuf;
+    //FILE* fin = fopen(path, "rb");
+    //if (!fin) {
+    //    return;
+    //}
+    //png_structp png = png_create_read_struct(
+    //    PNG_LIBPNG_VER_STRING, &jbuf,
+    //    &texload_error_handler, &texload_warning_handler);
+    //if (png) {
+    //    png_infop info = png_create_info_struct(png);
+    //    if (info) {
+    //        if (!setjmp(jbuf)) {
+    //            png_init_io(png, fin);
+    //            png_read_info(png, info);
+    //            png_uint_32 width;
+    //            png_uint_32 height;
+    //            int bitdepth;
+    //            int colortype;
+    //            png_get_IHDR(png, info,
+    //                &width, &height,
+    //                &bitdepth, &colortype, 0, 0, 0);
+    //            double gamma;
+    //            if (png_get_gAMA(png, info, &gamma)) {
+    //                png_set_gamma(png, 2.2, gamma);
+    //            } else {
+    //                png_set_gamma(png, 2.2, 0.45455);
+    //            }
+    //            if (colortype == PNG_COLOR_TYPE_PALETTE) {
+    //                png_set_palette_to_rgb(png);
+    //            }
+    //            if (colortype == PNG_COLOR_TYPE_GRAY && bitdepth < 8) {
+    //                png_set_expand_gray_1_2_4_to_8(png);
+    //            }
+    //            if (png_get_valid(png, info, PNG_INFO_tRNS)) {
+    //                png_set_tRNS_to_alpha(png);
+    //            } else {
+    //                int channels = png_get_channels(png, info);
+    //                if (channels == 1 || channels == 3) {
+    //                    png_set_add_alpha(png, 255, PNG_FILLER_AFTER);
+    //                }
+    //            }
+    //            if (colortype == PNG_COLOR_TYPE_GRAY ||
+    //                colortype == PNG_COLOR_TYPE_GRAY_ALPHA) {
+    //                png_set_gray_to_rgb(png);
+    //            }
+    //            if (bitdepth == 16) {
+    //                png_set_scale_16(png);
+    //            }
+    //            png_set_interlace_handling(png);
+    //            png_read_update_info(png, info);
+    //            std::vector<uint8_t> pixels(width * height * 4, 0);
+    //            std::vector<uint8_t*> rowpointers(height);
+    //            for (unsigned y = 0; y < height; ++y) {
+    //                rowpointers[y] =
+    //                    pixels.data() + y * width * 4;
+    //            }
+    //            png_read_image(png, (png_bytep*)rowpointers.data());
+    //            png_read_end(png, nullptr);
+    //            this->width = width;
+    //            this->height = height;
+    //            this->pixels = std::move(pixels);
+    //        }
+    //    }
+    //    png_destroy_read_struct(
+    //        &png,
+    //        info ? &info : nullptr,
+    //        nullptr);
+    //}
+    //fclose(fin);
 }
 
 FDisp ColorTexture::Pixel(int ix, int iy) const

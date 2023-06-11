@@ -58,7 +58,7 @@ struct MatLoader
     void TryBeginMaterial(std::string const& line)
     {
         char namebuf[256] = "";
-        if (sscanf(line.c_str(), " >> %256s", namebuf) != 0) {
+        if (sscanf(line.c_str(), " >> %255s", namebuf) != 0) {
             ToLower(namebuf);
             current = &materials[namebuf];
         }
@@ -70,19 +70,19 @@ struct MatLoader
             return;
         }
         char pathbuf[256] = "";
-        if (sscanf(line.c_str(), " Emit: %256s", pathbuf) != 0) {
+        if (sscanf(line.c_str(), " Emit: %255s", pathbuf) != 0) {
             ToLower(pathbuf);
             current->emittex = pathbuf;
         }
-        if (sscanf(line.c_str(), " Albedo: %256s", pathbuf) != 0) {
+        if (sscanf(line.c_str(), " Albedo: %255s", pathbuf) != 0) {
             ToLower(pathbuf);
             current->albedotex = pathbuf;
         }
-        if (sscanf(line.c_str(), " Transparency: %256s", pathbuf) != 0) {
+        if (sscanf(line.c_str(), " Transparency: %255s", pathbuf) != 0) {
             ToLower(pathbuf);
             current->transparencytex = pathbuf;
         }
-        if (sscanf(line.c_str(), " Roughness: %256s", pathbuf) != 0) {
+        if (sscanf(line.c_str(), " Roughness: %255s", pathbuf) != 0) {
             ToLower(pathbuf);
             current->roughnesstex = pathbuf;
         }
@@ -191,8 +191,8 @@ struct T3DLoader
         unsigned int flags = 0;
         char texturebuf[256] = "";
         if (false
-            || sscanf(line.c_str(), " Begin Polygon Item=%*s Texture=%256s Flags=%u", texturebuf, &flags) != 0
-            || sscanf(line.c_str(), " Begin Polygon Texture=%256s Flags=%u", texturebuf, &flags) != 0
+            || sscanf(line.c_str(), " Begin Polygon Item=%*s Texture=%255s Flags=%u", texturebuf, &flags) != 0
+            || sscanf(line.c_str(), " Begin Polygon Texture=%255s Flags=%u", texturebuf, &flags) != 0
             || sscanf(line.c_str(), " Begin Polygon Item=%*s Flags=%u", &flags) != 0
             || sscanf(line.c_str(), " Begin Polygon Flags=%u", &flags) != 0
         ) {

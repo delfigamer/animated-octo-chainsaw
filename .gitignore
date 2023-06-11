@@ -2,8 +2,10 @@
 /Debug
 /Release
 /x64
-/ForwardTracer/Debug
-/ForwardTracer/Release
-/ForwardTracer/x64
+/Project/Debug
+/Project/Release
+/Project/x64
 *.aps
 *.user
+*.tlog
+*.log
