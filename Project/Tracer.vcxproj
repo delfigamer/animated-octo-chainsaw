@@ -68,6 +68,9 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)Src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
@@ -88,6 +91,9 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;winspool.lib;comdlg32.lib;advapi32.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;odbc32.lib;odbccp32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(SolutionDir)Src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="..\Src\AlignedBuffer.h" />
@@ -101,9 +107,9 @@
     <ClInclude Include="..\Src\FLin.h" />
     <ClInclude Include="..\Src\ParameterSampler.h" />
     <ClInclude Include="..\Src\RayPipeline.h" />
+    <ClInclude Include="..\Src\resource.h" />
     <ClInclude Include="..\Src\SamplerBase.h" />
     <ClInclude Include="..\Src\RendererThread.h" />
-    <ClInclude Include="..\Src\Resource.h" />
     <ClInclude Include="..\Src\Spectrum.h" />
     <ClInclude Include="..\Src\targetver.h" />
     <ClInclude Include="..\Src\Texture.h" />

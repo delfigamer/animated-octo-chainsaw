@@ -126,7 +126,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         int wmId = LOWORD(wParam);
         // Parse the menu selections:
         switch (wmId) {
-        case IDM_ABOUT:
+        case IDM_HELP:
             DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
             break;
         case IDM_EXIT:

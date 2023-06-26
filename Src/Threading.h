@@ -86,7 +86,7 @@ public:
     static int total_worker_count();
     static WorkerId current_worker_id();
 };
-
+/*
 template<typename T>
 class PerWorkerMap {
     std::vector<T> _elems;
@@ -120,3 +120,4 @@ typename PerWorkerMap<T>::View PerWorkerMap<T>::current() {
         return View{&_shared, std::unique_lock<std::mutex>(_shared_mutex)};
     }
 }
+*/

@@ -166,7 +166,7 @@ private:
         void clear();
     };
 
-    using RayBuffer2 = std::vector<std::unique_ptr<Ray>>;
+    //using RayBuffer2 = std::vector<std::unique_ptr<Ray>>;
 
 public:
     struct RayData {
@@ -204,12 +204,10 @@ public:
 
 private:
     struct RayPacketFunnel {
-        PerWorkerMap<std::unique_ptr<RayPacket>> building_per_worker;
         std::mutex full_packets_mutex;
         std::vector<std::unique_ptr<RayPacket>> full_packets;
 
-        void insert(RayPipeline& pipeline, RayData ray_data);
-        void insert(RayPipeline& pipeline, std::unique_ptr<RayPacket> ray_packet);
+        void insert(std::unique_ptr<RayPacket> ray_packet);
         bool full_packets_empty();
         std::unique_ptr<RayPacket> pop_full_packet();
     };
@@ -222,7 +220,7 @@ private:
         void* triangles;
         PackedNode* nodes;
         //std::vector<std::unique_ptr<RayBuffer2>> ray_buffers_pending;
-        std::unique_ptr<RayBuffer2> ray_buffer_current;
+        //std::unique_ptr<RayBuffer2> ray_buffer_current;
         RayPacketFunnel pending_funnel;
     };
 
@@ -235,6 +233,21 @@ private:
         RayPacketFunnel completed_funnel;
     };
 
+public:
+    struct Inserter {
+        RayPipeline* pipeline_ptr;
+        Tree* ptree_ptr;
+        std::unique_ptr<RayPacket> packet_ptr;
+
+        Inserter(RayPipeline& pipeline, Tree& ptree);
+        Inserter(Inserter&&) = default;
+        Inserter& operator=(Inserter&&) = default;
+        ~Inserter();
+        void schedule(Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param);
+        void schedule(Vec3 origin, Vec3 direction, void* extra_data);
+    };
+
+private:
     RayPipelineParams params;
     std::vector<std::unique_ptr<Tree>> zone_trees;
     std::shared_ptr<ProcessorControl> processor_control;
@@ -255,15 +268,17 @@ public:
 
     std::unique_ptr<RayPacket> create_ray_packet();
     void collect_ray_packet_spare(std::unique_ptr<RayPacket> packet_ptr);
-    std::unique_ptr<RayBuffer2> create_ray_buffer_2();
+    //std::unique_ptr<RayBuffer2> create_ray_buffer_2();
 
     void trace_immediately(Ray& ray);
-    void schedule(std::unique_ptr<Ray> ray_ptr);
-    void flush();
+    //void schedule(std::unique_ptr<Ray> ray_ptr);
+    //void flush();
 
-    void schedule(Tree& ptree, RayData ray_data);
-    void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param);
-    void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data);
+    //void schedule(Tree& ptree, RayData ray_data);
+    //void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param);
+    //void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data);
+
+    Inserter inserter(size_t zone_id);
 
     bool completed_packets_empty();
     RayPacketCompleted pop_completed_packet();

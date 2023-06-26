@@ -20,6 +20,7 @@
 #define IDM_PAUSE                       32776
 #define ID_RESUME                       32777
 #define IDM_RESUME                      32778
+#define IDM_HELP                        32779
 #define IDC_STATIC                      -1
 
 // Next default values for new objects

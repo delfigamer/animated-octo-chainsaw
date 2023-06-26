@@ -56,6 +56,8 @@ struct RayPipeline::Internal {
     struct RayScheduler;
     struct ChunkProcessor;
     struct TreeProcessor;
+
+    static void append_ray(RayPipeline& pipeline, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data);
 };
 
 size_t RayPipelineParams::sizeof_packed_triangle() const {
@@ -234,7 +236,7 @@ RayPipeline::RayData RayPipeline::RayPacket::extract_ray_data(size_t index) {
     return ray_data;
 }
 
-void RayPipeline::RayPacketFunnel::insert(RayPipeline& pipeline, RayData ray_data) {
+/*void RayPipeline::RayPacketFunnel::insert(RayPipeline& pipeline, RayData ray_data) {
     std::unique_ptr<RayPacket> new_full_packet;
     {
         auto building_view = building_per_worker.current();
@@ -252,9 +254,9 @@ void RayPipeline::RayPacketFunnel::insert(RayPipeline& pipeline, RayData ray_dat
         std::lock_guard<std::mutex> guard(full_packets_mutex);
         full_packets.push_back(std::move(new_full_packet));
     }
-}
+}*/
 
-void RayPipeline::RayPacketFunnel::insert(RayPipeline& pipeline, std::unique_ptr<RayPacket> ray_packet) {
+void RayPipeline::RayPacketFunnel::insert(std::unique_ptr<RayPacket> ray_packet) {
     std::lock_guard<std::mutex> guard(full_packets_mutex);
     full_packets.push_back(std::move(ray_packet));
 }
@@ -763,11 +765,11 @@ void RayPipeline::collect_ray_packet_spare(std::unique_ptr<RayPacket> packet_ptr
     }
 }
 
-std::unique_ptr<RayPipeline::RayBuffer2> RayPipeline::create_ray_buffer_2() {
+/*std::unique_ptr<RayPipeline::RayBuffer2> RayPipeline::create_ray_buffer_2() {
     RayBuffer2 buffer;
     buffer.reserve(params.ray_buffer_size);
     return std::make_unique<RayBuffer2>(std::move(buffer));
-}
+}*/
 
 struct RayPipeline::Internal::Utils {
     static void get_coord_param_interval_minmax(float ray_origin, float ray_dir_inverse, float box_min, float box_max, float& minp, float& maxp) {
@@ -1077,6 +1079,52 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         }
     };
 
+    struct YmmSpaceShear {
+        YmmInt permutation;
+        YmmFloat sx, sy, sz;
+
+        static YmmSpaceShear make_for(YmmVec3 dir) {
+            YmmFloatData dx_data = dir.x.data();
+            YmmFloatData dy_data = dir.y.data();
+            YmmFloatData dz_data = dir.z.data();
+            YmmIntData permutation_data;
+            YmmFloatData sx_data, sy_data, sz_data;
+            for (int i = 0; i < 8; ++i) {
+                float d[3] = {dx_data.x[i], dy_data.x[i], dz_data.x[i]};
+                int max_dim = 0;
+                if (fabsf(d[1]) > fabsf(d[0])) {
+                    max_dim = 1;
+                }
+                if (fabsf(d[2]) > fabsf(d[max_dim])) {
+                    max_dim = 2;
+                }
+                int kz = max_dim;
+                int kx = (kz + 1) % 3;
+                int ky = (kx + 1) % 3;
+                if (d[kz] < 0) {
+                    std::swap(kx, ky);
+                }
+                permutation_data.x[i] = (int32_t)(((uint32_t)kx << 30) | ((uint32_t)ky << 28) | ((uint32_t)kz << 26));
+                sx_data.x[i] = d[kx] / d[kz];
+                sy_data.x[i] = d[ky] / d[kz];
+                sz_data.x[i] = 1.0f / d[kz];
+            }
+            YmmSpaceShear ss;
+            ss.permutation = YmmInt(permutation_data);
+            ss.sx = YmmFloat(sx_data);
+            ss.sy = YmmFloat(sy_data);
+            ss.sz = YmmFloat(sz_data);
+            return ss;
+        }
+
+        YmmVec3 apply_permutation(YmmVec3 v) {
+            YmmFloat nx = _mm256_blendv_ps(_mm256_blendv_ps(v.x, v.y, YmmFloat(_mm256_slli_epi32(permutation, 1))), v.z, YmmFloat(permutation));
+            YmmFloat ny = _mm256_blendv_ps(_mm256_blendv_ps(v.x, v.y, YmmFloat(_mm256_slli_epi32(permutation, 3))), v.z, YmmFloat(_mm256_slli_epi32(permutation, 2)));
+            YmmFloat nz = _mm256_blendv_ps(_mm256_blendv_ps(v.x, v.y, YmmFloat(_mm256_slli_epi32(permutation, 5))), v.z, YmmFloat(_mm256_slli_epi32(permutation, 4)));
+            return YmmVec3{nx, ny, nz};
+        }
+    };
+
     RayPipeline& pipeline;
     Chunk& chunk;
     YmmVec3 origin;
@@ -1085,6 +1133,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
     YmmFloat min_param;
     YmmFloat max_param;
     YmmInt hit_triangle_index;
+    YmmSpaceShear ray_space_shear;
 
     static void get_coord_param_interval_minmax(YmmFloat ray_origin, YmmFloat ray_dir_inverse, YmmFloat box_min, YmmFloat box_max, YmmFloat& minp, YmmFloat& maxp) {
         YmmFloat p1 = (box_min - ray_origin) * ray_dir_inverse;
@@ -1127,33 +1176,37 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         YmmVec3 a = wa - origin;
         YmmVec3 b = wb - origin;
         YmmVec3 c = wc - origin;
-        //float ax = a[ray_space_shear.kx] - ray_space_shear.sx * a[ray_space_shear.kz];
-        //float ay = a[ray_space_shear.ky] - ray_space_shear.sy * a[ray_space_shear.kz];
-        //float bx = b[ray_space_shear.kx] - ray_space_shear.sx * b[ray_space_shear.kz];
-        //float by = b[ray_space_shear.ky] - ray_space_shear.sy * b[ray_space_shear.kz];
-        //float cx = c[ray_space_shear.kx] - ray_space_shear.sx * c[ray_space_shear.kz];
-        //float cy = c[ray_space_shear.ky] - ray_space_shear.sy * c[ray_space_shear.kz];
-        //float u = cx * by - cy * bx;
-        //float v = ax * cy - ay * cx;
-        //float w = bx * ay - by * ax;
-        YmmFloat u = -det3(direction, a, b);
-        YmmFloat v = -det3(direction, b, c);
-        YmmFloat w = -det3(direction, c, a);
+        YmmVec3 ap = ray_space_shear.apply_permutation(a);
+        YmmVec3 bp = ray_space_shear.apply_permutation(b);
+        YmmVec3 cp = ray_space_shear.apply_permutation(c);
+        YmmFloat apx = ap.x - ray_space_shear.sx * ap.z;
+        YmmFloat apy = ap.y - ray_space_shear.sy * ap.z;
+        YmmFloat bpx = bp.x - ray_space_shear.sx * bp.z;
+        YmmFloat bpy = bp.y - ray_space_shear.sy * bp.z;
+        YmmFloat cpx = cp.x - ray_space_shear.sx * cp.z;
+        YmmFloat cpy = cp.y - ray_space_shear.sy * cp.z;
+        YmmFloat u = cpx * bpy - cpy * bpx;
+        YmmFloat v = apx * cpy - apy * cpx;
+        YmmFloat w = bpx * apy - bpy * apx;
+        //YmmFloat u2 = -det3(direction, a, b);
+        //YmmFloat v2 = -det3(direction, b, c);
+        //YmmFloat w2 = -det3(direction, c, a);
         YmmFloat is_interior = is_triangle & (u >= YmmFloat::set1(0)) & (v >= YmmFloat::set1(0)) & (w >= YmmFloat::set1(0));
         YmmFloat det = u + v + w;
+        //YmmFloat det2 = u2 + v2 + w2;
         YmmFloat is_valid_hit = is_interior & (det != YmmFloat::set1(0));
         if (is_valid_hit.any()) {
-            //float az = ray_space_shear.sz * a[ray_space_shear.kz];
-            //float bz = ray_space_shear.sz * b[ray_space_shear.kz];
-            //float cz = ray_space_shear.sz * c[ray_space_shear.kz];
-            //float t = u * az + v * bz + w * cz;
-            YmmFloat t = -det3(a, b, c);
+            YmmFloat apz = ray_space_shear.sz * ap.z;
+            YmmFloat bpz = ray_space_shear.sz * bp.z;
+            YmmFloat cpz = ray_space_shear.sz * cp.z;
+            YmmFloat t = u * apz + v * bpz + w * cpz;
+            //YmmFloat t2 = -det3(a, b, c);
             YmmFloat scaled_min_param = min_param * det;
             YmmFloat scaled_max_param = max_param * det;
             YmmFloat is_valid_param = is_valid_hit & (scaled_min_param <= t) & (t <= scaled_max_param);
             if (is_valid_param.any()) {
-                YmmFloat det_recip = det.recip();
-                YmmFloat param = t * det_recip;
+                YmmFloat param = t * det.recip();
+                //YmmFloat param2 = t2 * det2.recip();
                 max_param = YmmFloat::blend(max_param, param, is_valid_param);
                 hit_triangle_index = YmmInt::blend(hit_triangle_index, triangle_index, YmmInt(is_valid_param));
             }
@@ -1272,6 +1325,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
     }
 
     void process() {
+        ray_space_shear = YmmSpaceShear::make_for(direction);
         YmmInt sentinel_node_index = YmmInt::set1(chunk.sentinel_node_index);
         YmmInt node_index = YmmInt::set1(0);
         while (true) {
@@ -1295,7 +1349,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         }
     }
 };
-
+/*
 struct RayPipeline::Internal::ChunkIntersectorBulk {
     RayPipeline& pipeline;
     Chunk& chunk;
@@ -1396,7 +1450,8 @@ struct RayPipeline::Internal::ChunkIntersectorBulk {
         }
     }
 };
-
+*/
+/*
 void RayPipeline::Internal::RayScheduler::dispatch_ray(std::unique_ptr<Ray> ray_ptr) {
     Tree& ptree = *pipeline.zone_trees[ray_ptr->_zone_index];
     size_t total_chunk_count = ptree.chunks.size();
@@ -1433,7 +1488,8 @@ void RayPipeline::Internal::RayScheduler::dispatch_ray(std::unique_ptr<Ray> ray_
     }
     ray_ptr->on_completed(ray_ptr, pipeline);
 }
-
+*/
+/*
 void RayPipeline::schedule(std::unique_ptr<Ray> ray_ptr) {
     if (ray_ptr->_zone_index >= zone_trees.size()) {
         return ray_ptr->on_completed(ray_ptr, *this);
@@ -1451,7 +1507,8 @@ void RayPipeline::schedule(std::unique_ptr<Ray> ray_ptr) {
 
     Internal::RayScheduler{*this}.dispatch_ray(std::move(ray_ptr));
 }
-
+*/
+/*
 void RayPipeline::flush() {
     bool done = false;
     while (!done) {
@@ -1466,7 +1523,9 @@ void RayPipeline::flush() {
         }
     }
 }
+*/
 
+/*
 void RayPipeline::schedule(Tree& ptree, RayData ray_data) {
     if (!ray_data.reservation_heap.empty()) {
         ptree.pending_funnel.insert(*this, std::move(ray_data));
@@ -1474,8 +1533,42 @@ void RayPipeline::schedule(Tree& ptree, RayData ray_data) {
         ptree.completed_funnel.insert(*this, std::move(ray_data));
     }
 }
+*/
 
-void RayPipeline::schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param) {
+void RayPipeline::Internal::append_ray(RayPipeline& pipeline, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data) {
+    if (!packet_ptr) {
+        packet_ptr = pipeline.create_ray_packet();
+    }
+    packet_ptr->set_ray_data(packet_ptr->ray_count, std::move(ray_data));
+    packet_ptr->ray_count += 1;
+    if (packet_ptr->ray_count == packet_ptr->capacity) {
+        target_funnel.insert(std::move(packet_ptr));
+    }
+}
+
+RayPipeline::Inserter RayPipeline::inserter(size_t zone_id) {
+    if (zone_id < zone_trees.size()) {
+        Tree& ptree = *zone_trees[zone_id];
+        return Inserter(*this, ptree);
+    } else {
+        throw std::runtime_error("invalid zone id");
+    }
+}
+
+RayPipeline::Inserter::Inserter(RayPipeline& pipeline, Tree& ptree) {
+    pipeline_ptr = &pipeline;
+    ptree_ptr = &ptree;
+}
+
+RayPipeline::Inserter::~Inserter() {
+    if (packet_ptr) {
+        if (packet_ptr->ray_count > 0) {
+            ptree_ptr->pending_funnel.insert(std::move(packet_ptr));
+        }
+    }
+}
+
+void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param) {
     RayData ray_data;
     ray_data.origin = origin;
     ray_data.direction = direction;
@@ -1483,24 +1576,17 @@ void RayPipeline::schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* ex
     ray_data.max_param = max_param;
     ray_data.extra_data = extra_data;
     ray_data.hit_world_triangle_index = World::invalid_index;
-    if (zone_id < zone_trees.size()) {
-        Tree& ptree = *zone_trees[zone_id];
-        size_t root_index = ptree.node_boxes.size() - 1;
-        float minp = min_param, maxp = max_param;
-        Internal::Utils::clip_param_interval(params, origin, elementwise_inverse(direction), ptree.node_boxes[root_index], minp, maxp);
-        if (minp <= maxp) {
-            ray_data.reservation_heap.insert_reservation(root_index, minp);
-            ptree.pending_funnel.insert(*this, std::move(ray_data));
-        } else {
-            ptree.completed_funnel.insert(*this, std::move(ray_data));
-        }
-    } else {
-        throw std::runtime_error("invalid zone id");
+    size_t root_index = ptree_ptr->node_boxes.size() - 1;
+    float minp = min_param, maxp = max_param;
+    Internal::Utils::clip_param_interval(pipeline_ptr->params, origin, elementwise_inverse(direction), ptree_ptr->node_boxes[root_index], minp, maxp);
+    if (minp <= maxp) {
+        ray_data.reservation_heap.insert_reservation(root_index, minp);
     }
+    Internal::append_ray(*pipeline_ptr, packet_ptr, ptree_ptr->pending_funnel, std::move(ray_data));
 }
 
-void RayPipeline::schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data) {
-    return schedule(zone_id, origin, direction, extra_data, 0.0f, HUGE_VALF);
+void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, void* extra_data) {
+    return schedule(origin, direction, extra_data, 0.0f, HUGE_VALF);
 }
 
 bool RayPipeline::completed_packets_empty() {
@@ -1543,8 +1629,13 @@ bool RayPipeline::Internal::ChunkProcessor::has_pending_work_impl() {
 }
 
 bool RayPipeline::Internal::ChunkProcessor::work_impl() {
-    std::unique_ptr<RayPacket> packet_ptr = chunk.pending_funnel.pop_full_packet();
-    if (packet_ptr) {
+    bool work_performed = false;
+    while (true) {
+        std::unique_ptr<RayPacket> packet_ptr = chunk.pending_funnel.pop_full_packet();
+        if (!packet_ptr) {
+            break;
+        }
+        work_performed = true;
         size_t ray_count = packet_ptr->ray_count;
         size_t batch_count = (ray_count + 7) / 8;
         for (size_t i = ray_count; i < batch_count * 8; ++i) {
@@ -1580,11 +1671,9 @@ bool RayPipeline::Internal::ChunkProcessor::work_impl() {
                 }
             }
         }
-        ptree.pending_funnel.insert(pipeline, std::move(packet_ptr));
-        return true;
-    } else {
-        return false;
+        ptree.pending_funnel.insert(std::move(packet_ptr));
     }
+    return work_performed;
 }
 
 struct RayPipeline::Internal::TreeProcessor: Processor {
@@ -1606,44 +1695,58 @@ bool RayPipeline::Internal::TreeProcessor::has_pending_work_impl() {
 
 bool RayPipeline::Internal::TreeProcessor::work_impl() {
     bool work_performed = false;
-    std::unique_ptr<RayPacket> packet_ptr = ptree.pending_funnel.pop_full_packet();
-    if (packet_ptr) {
+    {
         size_t total_chunk_count = ptree.chunks.size();
-        for (size_t i = 0; i < packet_ptr->ray_count; ++i) {
-            RayData ray_data = packet_ptr->extract_ray_data(i);
-            Vec3 dir_inverse = elementwise_inverse(ray_data.direction);
-            size_t chunk_index_to_insert = World::invalid_index;
-            while (!ray_data.reservation_heap.empty()) {
-                ReservationHeap::NodeReservation min_res = ray_data.reservation_heap.pop_min_reservation();
-                if (min_res.min_hit_param > ray_data.max_param) {
-                    ray_data.reservation_heap.clear();
-                    break;
-                }
-                size_t node_index = min_res.node_index;
-                if (node_index < total_chunk_count) {
-                    chunk_index_to_insert = node_index;
-                    break;
-                } else {
-                    size_t children_begin = ptree.node_child_indexes[node_index - total_chunk_count];
-                    size_t children_end = ptree.node_child_indexes[node_index - total_chunk_count + 1];
-                    for (size_t i = children_begin; i < children_end; ++i) {
-                        float minp = ray_data.min_param, maxp = ray_data.max_param;
-                        Utils::clip_param_interval(pipeline.params, ray_data.origin, dir_inverse, ptree.node_boxes[i], minp, maxp);
-                        if (minp <= maxp) {
-                            ray_data.reservation_heap.insert_reservation(i, minp);
+        std::vector<std::unique_ptr<RayPacket>> per_chunk_buffers(total_chunk_count);
+        std::unique_ptr<RayPacket> completed_buffer;
+        while (true) {
+            std::unique_ptr<RayPacket> packet_ptr = ptree.pending_funnel.pop_full_packet();
+            if (!packet_ptr) {
+                break;
+            }
+            work_performed = true;
+            for (size_t i = 0; i < packet_ptr->ray_count; ++i) {
+                RayData ray_data = packet_ptr->extract_ray_data(i);
+                Vec3 dir_inverse = elementwise_inverse(ray_data.direction);
+                size_t chunk_index_to_insert = World::invalid_index;
+                while (!ray_data.reservation_heap.empty()) {
+                    ReservationHeap::NodeReservation min_res = ray_data.reservation_heap.pop_min_reservation();
+                    if (min_res.min_hit_param > ray_data.max_param) {
+                        ray_data.reservation_heap.clear();
+                        break;
+                    }
+                    size_t node_index = min_res.node_index;
+                    if (node_index < total_chunk_count) {
+                        chunk_index_to_insert = node_index;
+                        break;
+                    } else {
+                        size_t children_begin = ptree.node_child_indexes[node_index - total_chunk_count];
+                        size_t children_end = ptree.node_child_indexes[node_index - total_chunk_count + 1];
+                        for (size_t i = children_begin; i < children_end; ++i) {
+                            float minp = ray_data.min_param, maxp = ray_data.max_param;
+                            Utils::clip_param_interval(pipeline.params, ray_data.origin, dir_inverse, ptree.node_boxes[i], minp, maxp);
+                            if (minp <= maxp) {
+                                ray_data.reservation_heap.insert_reservation(i, minp);
+                            }
                         }
                     }
                 }
+                if (chunk_index_to_insert != World::invalid_index) {
+                    Internal::append_ray(pipeline, per_chunk_buffers[chunk_index_to_insert], ptree.chunks[chunk_index_to_insert]->pending_funnel, std::move(ray_data));
+                } else {
+                    Internal::append_ray(pipeline, completed_buffer, ptree.completed_funnel, std::move(ray_data));
+                }
             }
-            if (chunk_index_to_insert != World::invalid_index) {
-                Chunk& chunk = *ptree.chunks[chunk_index_to_insert];
-                chunk.pending_funnel.insert(pipeline, std::move(ray_data));
-            } else {
-                ptree.completed_funnel.insert(pipeline, std::move(ray_data));
+            pipeline.collect_ray_packet_spare(std::move(packet_ptr));
+        }
+        for (size_t chunk_index = 0; chunk_index < total_chunk_count; ++chunk_index) {
+            if (per_chunk_buffers[chunk_index] && per_chunk_buffers[chunk_index]->ray_count > 0) {
+                ptree.chunks[chunk_index]->pending_funnel.insert(std::move(per_chunk_buffers[chunk_index]));
             }
         }
-        pipeline.collect_ray_packet_spare(std::move(packet_ptr));
-        work_performed = true;
+        if (completed_buffer && completed_buffer->ray_count > 0) {
+            ptree.completed_funnel.insert(std::move(completed_buffer));
+        }
     }
     while (std::unique_ptr<RayPacket> completed_packet_ptr = ptree.completed_funnel.pop_full_packet()) {
         work_performed = true;

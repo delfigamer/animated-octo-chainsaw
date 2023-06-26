@@ -121,7 +121,7 @@ struct Random {
     void gauss(float& u) {
         float q;
         u = 0;
-        for (int i = 0; i < 12*9; ++i) {
+        for (int i = 0; i < 6*9; ++i) {
             triangle(q);
             u += q;
         }
@@ -207,10 +207,16 @@ struct RetiredRaysProcessor: Processor {
     }
 
     virtual bool work_impl() override {
-        RayPipeline::RayPacketCompleted packet_completed = pipeline.pop_completed_packet();
-        std::unique_ptr<RayPipeline::RayPacket> packet_ptr = std::move(packet_completed.packet_ptr);
-        size_t zone_id = packet_completed.zone_id;
-        if (packet_ptr) {
+        bool work_performed = false;
+        std::unordered_map<size_t, RayPipeline::Inserter> per_zone_inserter_map;
+        while (true) {
+            RayPipeline::RayPacketCompleted packet_completed = pipeline.pop_completed_packet();
+            std::unique_ptr<RayPipeline::RayPacket> packet_ptr = std::move(packet_completed.packet_ptr);
+            size_t zone_id = packet_completed.zone_id;
+            if (!packet_ptr) {
+                break;
+            }
+            work_performed = true;
             for (int i = 0; i < packet_ptr->ray_count; ++i) {
                 RayPipeline::RayData ray_data = packet_ptr->extract_ray_data(i);
                 std::unique_ptr<ForwardRay> fray((ForwardRay*)ray_data.extra_data);
@@ -248,13 +254,13 @@ struct RetiredRaysProcessor: Processor {
                             } else if (mat_name == "Engine.Texture'ShaneChurch.Lampon5'") {
                                 emit = Vec3{10.00f, 3.00f, 5.00f};
                             } else if (mat_name == "Fire.WetTexture'LavaFX.Lava3'") {
-                                emit = Vec3{3.00f, 2.00f, 1.00f};
+                                emit = Vec3{1.00f, 0.30f, 0.10f};
                             } else if (mat_name == "Engine.Texture'DecayedS.Ceiling.T-CELING2'") {
-                                emit = Vec3{1.50f, 1.60f, 2.00f};
+                                emit = 5.0f * Vec3{0.80f, 1.00f, 2.00f};
                             } else {
-                                float afactor = 0.1f;
+                                float afactor = 0.6f;
                                 if (fabsf(normal.z) > fabsf(normal.x) && fabsf(normal.z) > fabsf(normal.y)) {
-                                    afactor = 0.2f;
+                                    afactor = 0.6f;
                                 }
                                 flux_gain = afactor * Vec3{1.00f, 0.95f, 0.80f};
                             }
@@ -280,8 +286,11 @@ struct RetiredRaysProcessor: Processor {
                     } else {
                         random.lambert(normal, new_direction);
                     }
-                    pipeline.schedule(
-                        target_zone_id,
+                    auto inserter_iter = per_zone_inserter_map.find(target_zone_id);
+                    if (inserter_iter == per_zone_inserter_map.end()) {
+                        inserter_iter = per_zone_inserter_map.emplace(std::make_pair(target_zone_id, pipeline.inserter(target_zone_id))).first;
+                    }
+                    inserter_iter->second.schedule(
                         new_origin,
                         new_direction,
                         fray.release());
@@ -295,29 +304,29 @@ struct RetiredRaysProcessor: Processor {
                 ray_counter.fetch_add(1, std::memory_order_relaxed);
             }
             pipeline.collect_ray_packet_spare(std::move(packet_ptr));
-            return true;
-        } else {
-            return false;
         }
+        return work_performed;
     }
 };
 
 struct NewRaysProcessor: Processor {
     World const& world;
     RayPipeline& pipeline;
+    std::atomic<bool>& pauserequested;
     Random random;
     size_t packet_count_threshold;
-    int iy;
     std::mutex self_mutex;
+    intptr_t iy;
 
-    NewRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, World const& world, RayPipeline& pipeline)
+    NewRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, World const& world, RayPipeline& pipeline, std::atomic<bool>& pauserequested)
         : Processor(std::move(control_ptr))
         , world(world)
         , pipeline(pipeline)
+        , pauserequested(pauserequested)
     {
-        size_t num = width * height * Scheduler::total_worker_count();
-        size_t den = 20 * pipeline.get_params().ray_buffer_size;
-        packet_count_threshold = 100 * Scheduler::total_worker_count() + (num + den - 1) / den;
+        //size_t num = width * height * Scheduler::total_worker_count();
+        //size_t den = 20 * pipeline.get_params().ray_buffer_size;
+        packet_count_threshold = 60000 / pipeline.get_params().ray_buffer_size;
         iy = 0;
     }
 
@@ -344,26 +353,34 @@ struct NewRaysProcessor: Processor {
         float vtan = ctan / sqrtf(aspect);
         size_t zone_index = world.zone_index_at(origin);
 
-        if (pipeline.get_total_packet_count() < packet_count_threshold) {
+        bool work_performed = false;
+        RayPipeline::Inserter inserter = pipeline.inserter(zone_index);
+        while (true) {
+            if (pipeline.get_total_packet_count() >= packet_count_threshold) {
+                break;
+            }
+            if (iy == 0 && pauserequested.load(std::memory_order_relaxed)) {
+                break;
+            }
+            work_performed = true;
             for (intptr_t ix = 0; ix < width; ++ix) {
                 float dx, dy;
                 random.gauss(dx);
                 random.gauss(dy);
+                dx *= 0.5f;
+                dy *= 0.5f;
                 float cx = 2.0f * (ix + dx + 0.5f) / width - 1.0f;
                 float cy = 1.0f - 2.0f * (iy + dy + 0.5f) / height;
                 float cu = cx * utan;
                 float cv = cy * vtan;
-                pipeline.schedule(
-                    zone_index,
+                inserter.schedule(
                     origin,
                     forward + cu * right + cv * down,
                     new ForwardRay(ix, iy));
             }
             iy = (iy + 1) % height;
-            return true;
-        } else {
-            return false;
         }
+        return work_performed;
     }
 };
 
@@ -372,10 +389,10 @@ void RendererThread::ThreadFunc()
     try {
         RayPipelineParams params;
         //params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointIndexed;
-        params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointImmediate;
-        //params.triangle_rep = RayPipelineParams::TriangleRep::MiddleCoordPermuted;
-        params.max_chunk_height = 9;
-        params.ray_buffer_size = 0x1000;
+        //params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointImmediate;
+        params.triangle_rep = RayPipelineParams::TriangleRep::MiddleCoordPermuted;
+        params.max_chunk_height = 8;
+        params.ray_buffer_size = 0x100;
         World world = load_world("Data\\map.bvh");
         //World world = load_test_world();
         RayPipeline pipeline(world, params);
@@ -400,7 +417,7 @@ void RendererThread::ThreadFunc()
 
         std::shared_ptr<ProcessorControl> this_control_ptr = std::make_shared<ProcessorControl>();
         for (int i = 0; i < 8; ++i) {
-            Scheduler::register_processor(std::make_shared<NewRaysProcessor>(this_control_ptr, world, pipeline));
+            Scheduler::register_processor(std::make_shared<NewRaysProcessor>(this_control_ptr, world, pipeline, pauserequested));
         }
         Scheduler::register_processor(std::make_shared<RetiredRaysProcessor>(this_control_ptr, world, pipeline, ray_counter, accum_buffer));
 
@@ -436,23 +453,34 @@ void RendererThread::ThreadFunc()
                 InvalidateRgn(hwnd, nullptr, false);
             }
 
-            uint64_t counter = ray_counter.load(std::memory_order_relaxed);
-            uint64_t time = GetTickCount64();
-            if (time <= start_time) {
-                ray_counter.store(0, std::memory_order_relaxed);
-                SendMessageTimeoutA(
-                    hwnd, WM_SETTEXT, (WPARAM)nullptr, (LPARAM)"rt | ...",
-                    SMTO_NORMAL, 100, nullptr);
-            } else {
-                char buf[1024];
+            char buf[1024];
+            if (pauserequested.load(std::memory_order_relaxed)) {
+                start_time = GetTickCount64() + 15000;
                 snprintf(
                     buf, sizeof(buf),
-                    "rt | %llu",
-                    (counter) / (time - start_time + 1));
-                SendMessageTimeoutA(
-                    hwnd, WM_SETTEXT, (WPARAM)nullptr, (LPARAM)buf,
-                    SMTO_NORMAL, 100, nullptr);
+                    "rt | packets: %llu | flushing",
+                    pipeline.get_total_packet_count());
+            } else {
+                uint64_t counter = ray_counter.load(std::memory_order_relaxed);
+                uint64_t time = GetTickCount64();
+                if (time <= start_time) {
+                    ray_counter.store(0, std::memory_order_relaxed);
+                    snprintf(
+                        buf, sizeof(buf),
+                        "rt | packets: %llu | warming up (%llus)",
+                        pipeline.get_total_packet_count(),
+                        (start_time - time) / 1000);
+                } else {
+                    snprintf(
+                        buf, sizeof(buf),
+                        "rt | packets: %llu | Krays per second: %llu",
+                        pipeline.get_total_packet_count(),
+                        (counter) / (time - start_time + 1));
+                }
             }
+            SendMessageTimeoutA(
+                hwnd, WM_SETTEXT, (WPARAM)nullptr, (LPARAM)buf,
+                SMTO_NORMAL, 100, nullptr);
         }
 
         this_control_ptr->set_dead();

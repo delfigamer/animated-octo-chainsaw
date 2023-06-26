@@ -21,9 +21,6 @@
     <ClInclude Include="..\Src\targetver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="..\Src\Resource.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="..\Src\Entry.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -82,6 +79,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\Src\Threading.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\Src\resource.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

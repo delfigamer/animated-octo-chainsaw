@@ -18,6 +18,7 @@ ProcessorControl::Guard& ProcessorControl::Guard::operator=(Guard&& other) {
     release();
     _control_ptr = other._control_ptr;
     other._control_ptr = nullptr;
+    return *this;
 }
 
 ProcessorControl::Guard::~Guard() {
@@ -176,8 +177,8 @@ void Scheduler::Worker::main(WorkerId id) {
 
 Scheduler::Scheduler() {
     _terminate_flag.store(false, std::memory_order_relaxed);
-    int worker_count = (std::thread::hardware_concurrency() + 1) / 2;
-    //worker_count = 8;
+    int worker_count = (std::thread::hardware_concurrency() * 3 + 3) / 4;
+    //worker_count = 1;
     _workers.resize(worker_count);
     for (int i = 0; i < worker_count; ++i) {
         _workers[i] = std::make_unique<Worker>(WorkerId(i + 1), *this);
