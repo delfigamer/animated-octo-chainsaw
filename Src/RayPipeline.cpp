@@ -57,7 +57,7 @@ struct RayPipeline::Internal {
     struct ChunkProcessor;
     struct TreeProcessor;
 
-    static void append_ray(RayPipeline& pipeline, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data);
+    static void append_ray(RayPipeline& pipeline, size_t zone_id, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data);
 };
 
 size_t RayPipelineParams::sizeof_packed_triangle() const {
@@ -717,21 +717,18 @@ RayPipelineParams const& RayPipeline::get_params() {
     return params;
 }
 
-std::unique_ptr<RayPipeline::RayPacket> RayPipeline::create_ray_packet() {
-    total_packet_count.fetch_add(1, std::memory_order_relaxed);
+std::unique_ptr<RayPipeline::RayPacket> RayPipeline::create_ray_packet(size_t zone_id) {
+    std::unique_ptr<RayPacket> packet_ptr;
     {
         std::lock_guard<std::mutex> guard(ray_packets_spare_mutex);
         if (!ray_packets_spare.empty()) {
-            std::unique_ptr<RayPacket> packet_ptr = std::move(ray_packets_spare.back());
+            packet_ptr = std::move(ray_packets_spare.back());
             ray_packets_spare.pop_back();
-            packet_ptr->id = next_packet_id.fetch_add(1, std::memory_order_relaxed);
-            return packet_ptr;
         }
     }
-    {
+    if (!packet_ptr) {
         int capacity = params.ray_buffer_size;
-        std::unique_ptr<RayPacket> packet_ptr = std::make_unique<RayPacket>();
-        packet_ptr->id = next_packet_id.fetch_add(1, std::memory_order_relaxed);
+        packet_ptr = std::make_unique<RayPacket>();
         packet_ptr->capacity = capacity;
         packet_ptr->ray_count = 0;
 
@@ -752,8 +749,11 @@ std::unique_ptr<RayPipeline::RayPacket> RayPipeline::create_ray_packet() {
 
         buffer_layout.transfer_data(packet_ptr->buffer.data());
 
-        return packet_ptr;
     }
+    packet_ptr->id = next_packet_id.fetch_add(1, std::memory_order_relaxed);
+    packet_ptr->zone_id = zone_id;
+    total_packet_count.fetch_add(1, std::memory_order_relaxed);
+    return packet_ptr;
 }
 
 void RayPipeline::collect_ray_packet_spare(std::unique_ptr<RayPacket> packet_ptr) {
@@ -1062,6 +1062,10 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
             return YmmVec3{a.x - b.x, a.y - b.y, a.z - b.z};
         }
 
+        friend YmmVec3 operator*(YmmFloat a, YmmVec3 b) {
+            return YmmVec3{a * b.x, a * b.y, a * b.z};
+        }
+
         friend YmmVec3 cross(YmmVec3 a, YmmVec3 b) {
             return YmmVec3{
                 a.y * b.z - a.z * b.y,
@@ -1281,16 +1285,66 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         }
         }
         YmmVec3 a, b, c;
-        a.x = _mm256_blendv_ps(_mm256_blendv_ps(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 31))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 30)));
-        a.y = _mm256_blendv_ps(_mm256_blendv_ps(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 29))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 28)));
-        a.z = _mm256_blendv_ps(_mm256_blendv_ps(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 27))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 26)));
-        b.x = _mm256_blendv_ps(_mm256_blendv_ps(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 25))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 24)));
-        b.y = _mm256_blendv_ps(_mm256_blendv_ps(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 23))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 22)));
-        b.z = _mm256_blendv_ps(_mm256_blendv_ps(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 21))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 20)));
-        c.x = _mm256_blendv_ps(_mm256_blendv_ps(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 19))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 18)));
-        c.y = _mm256_blendv_ps(_mm256_blendv_ps(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 17))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 16)));
-        c.z = _mm256_blendv_ps(_mm256_blendv_ps(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 15))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 14)));
+        a.x = YmmFloat::blend(YmmFloat::blend(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 31))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 30)));
+        a.y = YmmFloat::blend(YmmFloat::blend(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 29))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 28)));
+        a.z = YmmFloat::blend(YmmFloat::blend(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 27))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 26)));
+        b.x = YmmFloat::blend(YmmFloat::blend(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 25))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 24)));
+        b.y = YmmFloat::blend(YmmFloat::blend(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 23))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 22)));
+        b.z = YmmFloat::blend(YmmFloat::blend(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 21))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 20)));
+        c.x = YmmFloat::blend(YmmFloat::blend(tmin.x, tmid.x, YmmFloat(_mm256_slli_epi32(pmask, 19))), tmax.x, YmmFloat(_mm256_slli_epi32(pmask, 18)));
+        c.y = YmmFloat::blend(YmmFloat::blend(tmin.y, tmid.y, YmmFloat(_mm256_slli_epi32(pmask, 17))), tmax.y, YmmFloat(_mm256_slli_epi32(pmask, 16)));
+        c.z = YmmFloat::blend(YmmFloat::blend(tmin.z, tmid.z, YmmFloat(_mm256_slli_epi32(pmask, 15))), tmax.z, YmmFloat(_mm256_slli_epi32(pmask, 14)));
         process_triangle_triple_point_common(is_triangle, triangle_index, a, b, c);
+    }
+
+    void process_triangle_box_centered_common(YmmInt is_triangle, YmmInt triangle_index, YmmVec3 center, YmmVec3 du, YmmVec3 dv, YmmVec3 dn) {
+        YmmFloat det = -dot(direction, dn);
+        YmmFloat is_in_front = YmmFloat(is_triangle) & (det >= YmmFloat::set1(0));
+        YmmVec3 origin_relative = origin - center;
+        YmmFloat t = dot(origin_relative, dn);
+        YmmFloat scaled_min_param = min_param * det;
+        YmmFloat scaled_max_param = max_param * det;
+        YmmFloat is_valid_param = is_in_front & (scaled_min_param <= t) & (t <= scaled_max_param);
+        if (is_valid_param.any()) {
+            YmmFloat param = t * det.recip();
+            YmmVec3 rel_hit = origin_relative + param * direction;
+            YmmFloat hit_u = dot(rel_hit, du);
+            YmmFloat hit_v = dot(rel_hit, dv);
+            YmmFloat is_interior = (hit_u >= YmmFloat::set1(-1)) & (hit_v >= YmmFloat::set1(-1)) & (hit_u + hit_v <= YmmFloat::set1(1));
+            YmmFloat is_valid_hit = is_valid_param & is_interior;
+            if (is_valid_hit.any()) {
+                max_param = YmmFloat::blend(max_param, param, is_valid_hit);
+                hit_triangle_index = YmmInt::blend(hit_triangle_index, triangle_index, YmmInt(is_valid_hit));
+            }
+        }
+    }
+
+    void process_triangle_box_centered_uv(YmmBox box, YmmInt is_triangle, YmmInt triangle_index) {
+        YmmFloatData const* triangles_ptr = (YmmFloatData const*)chunk.triangles;
+        YmmFloat triangle_data_a[8];
+        for (int i = 0; i < 8; ++i) {
+            triangle_data_a[i] = YmmFloat(triangles_ptr[triangle_index.x[i]]);
+        }
+        YmmVec3 du, dv;
+        YmmFloat unused1, unused2;
+        YmmFloat::transpose8(triangle_data_a, du.x, du.y, du.z, dv.x, dv.y, dv.z, unused1, unused2);
+        YmmVec3 dn = cross(du, dv);
+        YmmVec3 center;
+        switch (pipeline.params.box_rep) {
+        case RayPipelineParams::BoxRep::MinMax:
+        {
+            YmmVec3 tmin = YmmVec3{box.v[0], box.v[1], box.v[2]};
+            YmmVec3 tmax = YmmVec3{box.v[3], box.v[4], box.v[5]};
+            center = YmmFloat::set1(0.5f) * (tmin + tmax);
+            break;
+        }
+        case RayPipelineParams::BoxRep::CenterExtent:
+        {
+            center = YmmVec3{box.v[0], box.v[1], box.v[2]};
+            break;
+        }
+        }
+        process_triangle_box_centered_common(is_triangle, triangle_index, center, du, dv, dn);
     }
     
     void process_triangle(YmmBox box, YmmInt is_triangle, YmmInt triangle_index) {
@@ -1302,6 +1356,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         case RayPipelineParams::TriangleRep::MiddleCoordPermuted:
             return process_triangle_middle_coord_permuted(box, is_triangle, triangle_index);
         case RayPipelineParams::TriangleRep::BoxCenteredUV:
+            return process_triangle_box_centered_uv(box, is_triangle, triangle_index);
         case RayPipelineParams::TriangleRep::BoxCenteredUVExplicitN:
         {
             break;
@@ -1535,9 +1590,9 @@ void RayPipeline::schedule(Tree& ptree, RayData ray_data) {
 }
 */
 
-void RayPipeline::Internal::append_ray(RayPipeline& pipeline, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data) {
+void RayPipeline::Internal::append_ray(RayPipeline& pipeline, size_t zone_id, std::unique_ptr<RayPacket>& packet_ptr, RayPacketFunnel& target_funnel, RayData ray_data) {
     if (!packet_ptr) {
-        packet_ptr = pipeline.create_ray_packet();
+        packet_ptr = pipeline.create_ray_packet(zone_id);
     }
     packet_ptr->set_ray_data(packet_ptr->ray_count, std::move(ray_data));
     packet_ptr->ray_count += 1;
@@ -1568,7 +1623,7 @@ RayPipeline::Inserter::~Inserter() {
     }
 }
 
-void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param) {
+void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, uint64_t extra_data, float min_param, float max_param) {
     RayData ray_data;
     ray_data.origin = origin;
     ray_data.direction = direction;
@@ -1582,10 +1637,10 @@ void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, void* extra_da
     if (minp <= maxp) {
         ray_data.reservation_heap.insert_reservation(root_index, minp);
     }
-    Internal::append_ray(*pipeline_ptr, packet_ptr, ptree_ptr->pending_funnel, std::move(ray_data));
+    Internal::append_ray(*pipeline_ptr, zone_id, packet_ptr, ptree_ptr->pending_funnel, std::move(ray_data));
 }
 
-void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, void* extra_data) {
+void RayPipeline::Inserter::schedule(Vec3 origin, Vec3 direction, uint64_t extra_data) {
     return schedule(origin, direction, extra_data, 0.0f, HUGE_VALF);
 }
 
@@ -1594,12 +1649,12 @@ bool RayPipeline::completed_packets_empty() {
     return ray_packets_completed.empty();
 }
 
-RayPipeline::RayPacketCompleted RayPipeline::pop_completed_packet() {
+std::unique_ptr<RayPipeline::RayPacket> RayPipeline::pop_completed_packet() {
     std::lock_guard<std::mutex> guard(ray_packets_completed_mutex);
     if (ray_packets_completed.empty()) {
-        return RayPacketCompleted{nullptr, World::invalid_index};
+        return nullptr;
     } else {
-        RayPacketCompleted result = std::move(ray_packets_completed.back());
+        std::unique_ptr<RayPacket> result = std::move(ray_packets_completed.back());
         ray_packets_completed.pop_back();
         return result;
     }
@@ -1679,14 +1734,15 @@ bool RayPipeline::Internal::ChunkProcessor::work_impl() {
 struct RayPipeline::Internal::TreeProcessor: Processor {
     RayPipeline& pipeline;
     RayPipeline::Tree& ptree;
+    size_t zone_id;
 
-    TreeProcessor(RayPipeline& pipeline, RayPipeline::Tree& ptree);
+    TreeProcessor(RayPipeline& pipeline, size_t zone_id);
     virtual bool has_pending_work_impl() override;
     virtual bool work_impl() override;
 };
 
-RayPipeline::Internal::TreeProcessor::TreeProcessor(RayPipeline& pipeline, RayPipeline::Tree& ptree)
-    : Processor(pipeline.processor_control), pipeline(pipeline), ptree(ptree) {
+RayPipeline::Internal::TreeProcessor::TreeProcessor(RayPipeline& pipeline, size_t zone_id)
+    : Processor(pipeline.processor_control), pipeline(pipeline), ptree(*pipeline.zone_trees[zone_id]), zone_id(zone_id) {
 }
 
 bool RayPipeline::Internal::TreeProcessor::has_pending_work_impl() {
@@ -1732,9 +1788,9 @@ bool RayPipeline::Internal::TreeProcessor::work_impl() {
                     }
                 }
                 if (chunk_index_to_insert != World::invalid_index) {
-                    Internal::append_ray(pipeline, per_chunk_buffers[chunk_index_to_insert], ptree.chunks[chunk_index_to_insert]->pending_funnel, std::move(ray_data));
+                    Internal::append_ray(pipeline, zone_id, per_chunk_buffers[chunk_index_to_insert], ptree.chunks[chunk_index_to_insert]->pending_funnel, std::move(ray_data));
                 } else {
-                    Internal::append_ray(pipeline, completed_buffer, ptree.completed_funnel, std::move(ray_data));
+                    Internal::append_ray(pipeline, zone_id, completed_buffer, ptree.completed_funnel, std::move(ray_data));
                 }
             }
             pipeline.collect_ray_packet_spare(std::move(packet_ptr));
@@ -1751,14 +1807,15 @@ bool RayPipeline::Internal::TreeProcessor::work_impl() {
     while (std::unique_ptr<RayPacket> completed_packet_ptr = ptree.completed_funnel.pop_full_packet()) {
         work_performed = true;
         std::lock_guard<std::mutex> guard(pipeline.ray_packets_completed_mutex);
-        pipeline.ray_packets_completed.push_back(RayPacketCompleted{std::move(completed_packet_ptr), ptree.index});
+        pipeline.ray_packets_completed.push_back(std::move(completed_packet_ptr));
     }
     return work_performed;
 }
 
 void RayPipeline::Internal::Loader::initialize_processor_objects() {
-    for (std::unique_ptr<Tree>& ptree_ptr : pipeline.zone_trees) {
-        Scheduler::register_processor(std::make_shared<TreeProcessor>(pipeline, *ptree_ptr));
+    for (size_t zone_id = 0; zone_id < pipeline.zone_trees.size(); ++zone_id) {
+        std::unique_ptr<Tree>& ptree_ptr = pipeline.zone_trees[zone_id];
+        Scheduler::register_processor(std::make_shared<TreeProcessor>(pipeline, zone_id));
         for (std::unique_ptr<Chunk>& chunk_ptr : ptree_ptr->chunks) {
             Scheduler::register_processor(std::make_shared<ChunkProcessor>(pipeline, *ptree_ptr, *chunk_ptr));
         }

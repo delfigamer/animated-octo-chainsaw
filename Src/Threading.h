@@ -86,38 +86,3 @@ public:
     static int total_worker_count();
     static WorkerId current_worker_id();
 };
-/*
-template<typename T>
-class PerWorkerMap {
-    std::vector<T> _elems;
-    T _shared;
-    std::mutex _shared_mutex;
-
-public:
-    struct View {
-        T* ptr;
-        std::unique_lock<std::mutex> guard;
-
-        T& operator*() { return *ptr; }
-        operator T*() { return ptr; }
-    };
-
-    PerWorkerMap();
-    View current();
-};
-
-template<typename T>
-PerWorkerMap<T>::PerWorkerMap() {
-    _elems.resize(Scheduler::total_worker_count());
-}
-
-template<typename T>
-typename PerWorkerMap<T>::View PerWorkerMap<T>::current() {
-    int id_int = (int)Scheduler::current_worker_id();
-    if (id_int > 0 && id_int <= _elems.size()) {
-        return View{&_elems[id_int - 1]};
-    } else {
-        return View{&_shared, std::unique_lock<std::mutex>(_shared_mutex)};
-    }
-}
-*/

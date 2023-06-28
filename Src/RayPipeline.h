@@ -174,7 +174,7 @@ public:
         float min_param, max_param;
         ReservationHeap reservation_heap;
         size_t hit_world_triangle_index;
-        void* extra_data;
+        uint64_t extra_data;
     };
 
     struct RayPacket {
@@ -190,16 +190,12 @@ public:
         float* max_param_array;
         ReservationHeap* reservation_heap_array;
         size_t* hit_world_triangle_index_array;
-        void** extra_data_array;
+        uint64_t* extra_data_array;
         uint64_t id;
+        size_t zone_id;
 
         void set_ray_data(size_t index, RayData ray_data);
         RayData extract_ray_data(size_t index);
-    };
-
-    struct RayPacketCompleted {
-        std::unique_ptr<RayPacket> packet_ptr;
-        size_t zone_id;
     };
 
 private:
@@ -237,14 +233,15 @@ public:
     struct Inserter {
         RayPipeline* pipeline_ptr;
         Tree* ptree_ptr;
+        size_t zone_id;
         std::unique_ptr<RayPacket> packet_ptr;
 
         Inserter(RayPipeline& pipeline, Tree& ptree);
         Inserter(Inserter&&) = default;
         Inserter& operator=(Inserter&&) = default;
         ~Inserter();
-        void schedule(Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param);
-        void schedule(Vec3 origin, Vec3 direction, void* extra_data);
+        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data, float min_param, float max_param);
+        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data);
     };
 
 private:
@@ -254,7 +251,7 @@ private:
     std::mutex ray_packets_spare_mutex;
     std::vector<std::unique_ptr<RayPacket>> ray_packets_spare;
     std::mutex ray_packets_completed_mutex;
-    std::vector<RayPacketCompleted> ray_packets_completed;
+    std::vector<std::unique_ptr<RayPacket>> ray_packets_completed;
     std::atomic<size_t> total_packet_count;
     std::atomic<uint64_t> next_packet_id;
 
@@ -266,7 +263,7 @@ public:
 
     RayPipelineParams const& get_params();
 
-    std::unique_ptr<RayPacket> create_ray_packet();
+    std::unique_ptr<RayPacket> create_ray_packet(size_t zone_id);
     void collect_ray_packet_spare(std::unique_ptr<RayPacket> packet_ptr);
     //std::unique_ptr<RayBuffer2> create_ray_buffer_2();
 
@@ -281,7 +278,7 @@ public:
     Inserter inserter(size_t zone_id);
 
     bool completed_packets_empty();
-    RayPacketCompleted pop_completed_packet();
+    std::unique_ptr<RayPacket> pop_completed_packet();
 
     size_t get_total_packet_count();
 };

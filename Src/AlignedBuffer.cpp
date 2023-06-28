@@ -43,6 +43,10 @@ char* AlignedBuffer::data() {
     return _data;
 }
 
-size_t AlignedBuffer::size() {
+char const* AlignedBuffer::data() const {
+    return _data;
+}
+
+size_t AlignedBuffer::size() const {
     return _size;
 }

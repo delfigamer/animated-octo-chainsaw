@@ -7,9 +7,9 @@
 #include "Threading.h"
 //#include <png.h>
 
-static int const width = 1280;
-static int const height = 720;
-static float const exposure = 4.0f;
+static int const width = 1600;
+static int const height = 900;
+static float const exposure = 70.0f;
 
 static bool IsImportantIndex(int index)
 {
@@ -49,41 +49,24 @@ static float Clamp(float x)
     return x;
 }
 
+static uint8_t tonemap_curve(float x) {
+    float t;
+    float v = x * exposure;
+    //t = 1.0f - expf(-v);
+    t = v / (v + 1.0f);
+    t = fminf(fmaxf(t, 0), 1);
+    t = sqrtf(t);
+    int b = (int)(t * 255.0f);
+    return b;
+}
+
 static void Tonemap(FDisp value, uint8_t* pixel)
 {
-    float ta, tb, tc;
-    if (true) {
-        float va, vb, vc;
-        value.unpack(va, vb, vc);
-        va *= exposure;
-        vb *= exposure;
-        vc *= exposure;
-        //ta = 1.0f - expf(-va);
-        //tb = 1.0f - expf(-vb);
-        //tc = 1.0f - expf(-vc);
-        ta = va / (va + 1.0f);
-        tb = vb / (vb + 1.0f);
-        tc = vc / (vc + 1.0f);
-    } else {
-        float l = luma(value);
-        ta = 0;
-        tb = 0;
-        tc = 0;
-        if (l > 0) {
-            tc = 1.0f - expf(-l);
-        } else {
-            ta = 1.0f - expf(l);
-        }
-    }
-    ta = fminf(fmaxf(ta, 0), 1);
-    tb = fminf(fmaxf(tb, 0), 1);
-    tc = fminf(fmaxf(tc, 0), 1);
-    int ba = (int)(sqrtf(ta) * 255.0f);
-    int bb = (int)(sqrtf(tb) * 255.0f);
-    int bc = (int)(sqrtf(tc) * 255.0f);
-    pixel[0] = bc;
-    pixel[1] = bb;
-    pixel[2] = ba;
+    float va, vb, vc;
+    value.unpack(va, vb, vc);
+    pixel[0] = tonemap_curve(vc);
+    pixel[1] = tonemap_curve(vb);
+    pixel[2] = tonemap_curve(va);
     pixel[3] = 255;
 }
 
@@ -176,68 +159,74 @@ struct ForwardRay {
     Vec3 flux;
     Vec3 emission;
 
-    ForwardRay(int x, int y)
-        : x(x)
-        , y(y)
-    {
-        flux = Vec3{1.0f, 1.0f, 1.0f};
-        emission = Vec3{0.0f, 0.0f, 0.0f};
+    static ForwardRay make(int x, int y) {
+        return ForwardRay{
+            x, y,
+            Vec3{1.0f, 1.0f, 1.0f},
+            Vec3{0.0f, 0.0f, 0.0f},
+        };
     }
 };
 
-struct RetiredRaysProcessor: Processor {
-    World const& world;
+struct Context {
+    static constexpr size_t accum_buffer_count = 8;
+
+    std::atomic<bool>& pauserequested;
+    World& world;
     RayPipeline& pipeline;
-    std::atomic<uint64_t>& ray_counter;
-    std::vector<double>& accum_buffer;
+    Arena<ForwardRay> fray_arena;
+    std::atomic<uint64_t> ray_counter;
+    std::mutex accum_buffer_mutexes[accum_buffer_count];
+    std::vector<float> accum_buffers[accum_buffer_count];
+};
+
+struct RetiredRaysProcessor: Processor {
+    Context& context;
     Random random;
 
-    RetiredRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, World const& world, RayPipeline& pipeline, std::atomic<uint64_t>& ray_counter, std::vector<double>& accum_buffer)
+    RetiredRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
         : Processor(std::move(control_ptr))
-        , world(world)
-        , pipeline(pipeline)
-        , ray_counter(ray_counter)
-        , accum_buffer(accum_buffer)
+        , context(context)
     {
-        //random.state += GetTickCount64();
     }
 
     virtual bool has_pending_work_impl() override {
-        return !pipeline.completed_packets_empty();
+        return !context.pipeline.completed_packets_empty();
     }
 
     virtual bool work_impl() override {
         bool work_performed = false;
         std::unordered_map<size_t, RayPipeline::Inserter> per_zone_inserter_map;
+        Arena<ForwardRay>::View fray_arena_view(context.fray_arena);
+        std::unique_lock<std::mutex> guard_accum_buffer;
+        size_t selected_buffer = World::invalid_index;
         while (true) {
-            RayPipeline::RayPacketCompleted packet_completed = pipeline.pop_completed_packet();
-            std::unique_ptr<RayPipeline::RayPacket> packet_ptr = std::move(packet_completed.packet_ptr);
-            size_t zone_id = packet_completed.zone_id;
+            std::unique_ptr<RayPipeline::RayPacket> packet_ptr = context.pipeline.pop_completed_packet();
             if (!packet_ptr) {
                 break;
             }
             work_performed = true;
             for (int i = 0; i < packet_ptr->ray_count; ++i) {
                 RayPipeline::RayData ray_data = packet_ptr->extract_ray_data(i);
-                std::unique_ptr<ForwardRay> fray((ForwardRay*)ray_data.extra_data);
+                ForwardRay& fray = fray_arena_view[ray_data.extra_data];
                 Vec3 normal{0.0f, 0.0f, 1.0f};
                 bool does_transmit = false;
                 Vec3 flux_gain = Vec3{0.0f, 0.0f, 0.0f};
                 float transmit_offset = 0.0f;
                 Vec3 emit = Vec3{0.0f, 0.0f, 0.0f};
-                size_t target_zone_id = zone_id;
+                size_t target_zone_id = packet_ptr->zone_id;
                 if (ray_data.hit_world_triangle_index != World::invalid_index) {
-                    World::Triangle const& tri = world.zone_trees[zone_id].triangles[ray_data.hit_world_triangle_index];
-                    World::Surface const& surface = world.surfaces[tri.surface_index];
-                    normal = world.normals[tri.normal_index];
+                    World::Triangle const& tri = context.world.zone_trees[packet_ptr->zone_id].triangles[ray_data.hit_world_triangle_index];
+                    World::Surface const& surface = context.world.surfaces[tri.surface_index];
+                    normal = context.world.normals[tri.normal_index];
                     if (surface.flags & World::flag_invisible) {
-                        does_transmit = true;
-                        flux_gain = Vec3{1.0f, 1.0f, 1.0f};
-                        target_zone_id = tri.other_zone_index;
-                    } else if (surface.flags & World::flag_masked) {
-                        does_transmit = true;
-                        flux_gain = Vec3{1.00f, 0.90f, 0.70f};
-                        transmit_offset = 0.001f;
+                        //does_transmit = true;
+                        //flux_gain = Vec3{1.0f, 1.0f, 1.0f};
+                        //target_zone_id = tri.other_zone_index;
+                    //} else if (surface.flags & World::flag_masked) {
+                    //    does_transmit = true;
+                    //    flux_gain = Vec3{1.00f, 0.90f, 0.70f};
+                    //    transmit_offset = 0.001f;
                     } else {
                         if (false) {
                             emit = Vec3{0.35f, 0.40f, 0.45f};
@@ -246,39 +235,40 @@ struct RetiredRaysProcessor: Processor {
                             emit.y = ((i / 100) % 100) / 100.0f;
                             emit.z = ((i / 10000) % 100) / 100.0f;
                         } else {
-                            std::string const& mat_name = world.material_names[surface.material_index];
+                            std::string const& mat_name = context.world.material_names[surface.material_index];
                             if (mat_name == "Fire.FireTexture'XFX.xeolighting'") {
                                 emit = Vec3{0.35f, 0.40f, 0.45f};
                             } else if (mat_name == "Fire.FireTexture'UTtech1.Misc.donfire'") {
                                 emit = Vec3{6.00f, 5.00f, 1.50f};
                             } else if (mat_name == "Engine.Texture'ShaneChurch.Lampon5'") {
                                 emit = Vec3{10.00f, 3.00f, 5.00f};
-                            } else if (mat_name == "Fire.WetTexture'LavaFX.Lava3'") {
-                                emit = Vec3{1.00f, 0.30f, 0.10f};
+                            //} else if (mat_name == "Fire.WetTexture'LavaFX.Lava3'") {
+                            //    emit = Vec3{1.00f, 0.30f, 0.10f};
                             } else if (mat_name == "Engine.Texture'DecayedS.Ceiling.T-CELING2'") {
-                                emit = 5.0f * Vec3{0.80f, 1.00f, 2.00f};
+                                emit = Vec3{10.00f, 11.00f, 12.00f};
                             } else {
-                                float afactor = 0.6f;
-                                if (fabsf(normal.z) > fabsf(normal.x) && fabsf(normal.z) > fabsf(normal.y)) {
-                                    afactor = 0.6f;
+                                Vec3 n = norm(normal);
+                                if (fabsf(normal.z) <= 0.2f) {
+                                    flux_gain = Vec3{0.60f, 0.03f, 0.03f};
+                                } else {
+                                    flux_gain = Vec3{0.30f, 0.30f, 0.40f};
                                 }
-                                flux_gain = afactor * Vec3{1.00f, 0.95f, 0.80f};
                             }
                         }
                     }
                 } else {
                     //emit = Vec3{100.00f, 0.00f, 100.00f};
                 }
-                fray->emission.x += fray->flux.x * emit.x;
-                fray->emission.y += fray->flux.y * emit.y;
-                fray->emission.z += fray->flux.z * emit.z;
+                fray.emission.x += fray.flux.x * emit.x;
+                fray.emission.y += fray.flux.y * emit.y;
+                fray.emission.z += fray.flux.z * emit.z;
                 float reflect_chance = fminf(1.0f, fmaxf(fmaxf(flux_gain.x, flux_gain.y), flux_gain.z));
                 bool is_reflected;
                 random.p(reflect_chance, is_reflected);
                 if (is_reflected) {
-                    fray->flux.x *= (1.0f / reflect_chance) * flux_gain.x;
-                    fray->flux.y *= (1.0f / reflect_chance) * flux_gain.y;
-                    fray->flux.z *= (1.0f / reflect_chance) * flux_gain.z;
+                    fray.flux.x *= (1.0f / reflect_chance) * flux_gain.x;
+                    fray.flux.y *= (1.0f / reflect_chance) * flux_gain.y;
+                    fray.flux.z *= (1.0f / reflect_chance) * flux_gain.z;
                     Vec3 new_origin = ray_data.origin + (ray_data.max_param + transmit_offset) * ray_data.direction;
                     Vec3 new_direction;
                     if (does_transmit) {
@@ -288,50 +278,57 @@ struct RetiredRaysProcessor: Processor {
                     }
                     auto inserter_iter = per_zone_inserter_map.find(target_zone_id);
                     if (inserter_iter == per_zone_inserter_map.end()) {
-                        inserter_iter = per_zone_inserter_map.emplace(std::make_pair(target_zone_id, pipeline.inserter(target_zone_id))).first;
+                        inserter_iter = per_zone_inserter_map.emplace(std::make_pair(target_zone_id, context.pipeline.inserter(target_zone_id))).first;
                     }
                     inserter_iter->second.schedule(
                         new_origin,
                         new_direction,
-                        fray.release());
+                        ray_data.extra_data);
                 } else {
-                    double* accum_ptr = accum_buffer.data() + fray->y * width * 4 + fray->x * 4;
-                    accum_ptr[0] += fray->emission.x;
-                    accum_ptr[1] += fray->emission.y;
-                    accum_ptr[2] += fray->emission.z;
+                    while (selected_buffer == World::invalid_index) {
+                        for (size_t i = 0; i < Context::accum_buffer_count; ++i) {
+                            guard_accum_buffer = std::unique_lock<std::mutex>(context.accum_buffer_mutexes[i], std::defer_lock);
+                            if (guard_accum_buffer.try_lock()) {
+                                selected_buffer = i;
+                                break;
+                            }
+                        }
+                    }
+                    float* accum_ptr = context.accum_buffers[selected_buffer].data() + fray.y * width * 4 + fray.x * 4;
+                    accum_ptr[0] += fray.emission.x;
+                    accum_ptr[1] += fray.emission.y;
+                    accum_ptr[2] += fray.emission.z;
                     accum_ptr[3] += 1.0;
+                    fray_arena_view.schedule_decrement(ray_data.extra_data);
                 }
-                ray_counter.fetch_add(1, std::memory_order_relaxed);
+                context.ray_counter.fetch_add(1, std::memory_order_relaxed);
             }
-            pipeline.collect_ray_packet_spare(std::move(packet_ptr));
+            context.pipeline.collect_ray_packet_spare(std::move(packet_ptr));
+            fray_arena_view.commit_decrements();
         }
         return work_performed;
     }
 };
 
 struct NewRaysProcessor: Processor {
-    World const& world;
-    RayPipeline& pipeline;
-    std::atomic<bool>& pauserequested;
+    Context& context;
     Random random;
     size_t packet_count_threshold;
     std::mutex self_mutex;
     intptr_t iy;
 
-    NewRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, World const& world, RayPipeline& pipeline, std::atomic<bool>& pauserequested)
+    NewRaysProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
         : Processor(std::move(control_ptr))
-        , world(world)
-        , pipeline(pipeline)
-        , pauserequested(pauserequested)
+        , context(context)
     {
         //size_t num = width * height * Scheduler::total_worker_count();
         //size_t den = 20 * pipeline.get_params().ray_buffer_size;
-        packet_count_threshold = 60000 / pipeline.get_params().ray_buffer_size;
+        packet_count_threshold = 100000 / context.pipeline.get_params().ray_buffer_size;
         iy = 0;
     }
 
     virtual bool has_pending_work_impl() override {
-        return pipeline.get_total_packet_count() < packet_count_threshold;
+        return context.pipeline.get_total_packet_count() < packet_count_threshold;
     }
 
     virtual bool work_impl() override {
@@ -351,32 +348,36 @@ struct NewRaysProcessor: Processor {
         float aspect = (float)width / (float)height;
         float utan = ctan * sqrtf(aspect);
         float vtan = ctan / sqrtf(aspect);
-        size_t zone_index = world.zone_index_at(origin);
+        size_t zone_index = context.world.zone_index_at(origin);
 
         bool work_performed = false;
-        RayPipeline::Inserter inserter = pipeline.inserter(zone_index);
+        RayPipeline::Inserter inserter = context.pipeline.inserter(zone_index);
+        Arena<ForwardRay>::Allocator fray_allocator(context.fray_arena);
         while (true) {
-            if (pipeline.get_total_packet_count() >= packet_count_threshold) {
+            if (context.pipeline.get_total_packet_count() >= packet_count_threshold) {
                 break;
             }
-            if (iy == 0 && pauserequested.load(std::memory_order_relaxed)) {
+            if (iy == 0 && context.pauserequested.load(std::memory_order_relaxed)) {
                 break;
             }
             work_performed = true;
             for (intptr_t ix = 0; ix < width; ++ix) {
                 float dx, dy;
-                random.gauss(dx);
-                random.gauss(dy);
-                dx *= 0.5f;
-                dy *= 0.5f;
+                random.triangle(dx);
+                random.triangle(dy);
+                dx *= 1.5f;
+                dy *= 1.5f;
                 float cx = 2.0f * (ix + dx + 0.5f) / width - 1.0f;
                 float cy = 1.0f - 2.0f * (iy + dy + 0.5f) / height;
                 float cu = cx * utan;
                 float cv = cy * vtan;
+                uint64_t fray_index;
+                ForwardRay& fray_data = fray_allocator.alloc(fray_index);
+                fray_data = ForwardRay::make(ix, iy);
                 inserter.schedule(
                     origin,
                     forward + cu * right + cv * down,
-                    new ForwardRay(ix, iy));
+                    fray_index);
             }
             iy = (iy + 1) % height;
         }
@@ -389,8 +390,9 @@ void RendererThread::ThreadFunc()
     try {
         RayPipelineParams params;
         //params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointIndexed;
-        //params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointImmediate;
-        params.triangle_rep = RayPipelineParams::TriangleRep::MiddleCoordPermuted;
+        params.triangle_rep = RayPipelineParams::TriangleRep::TriplePointImmediate;
+        //params.triangle_rep = RayPipelineParams::TriangleRep::MiddleCoordPermuted;
+        //params.triangle_rep = RayPipelineParams::TriangleRep::BoxCenteredUV;
         params.max_chunk_height = 8;
         params.ray_buffer_size = 0x100;
         World world = load_world("Data\\map.bvh");
@@ -412,21 +414,26 @@ void RendererThread::ThreadFunc()
         //// 99, 156
         //size_t zone_index = world.zone_index_at(origin);
 
-        std::atomic<uint64_t> ray_counter = 0;
-        std::vector<double> accum_buffer(width * height * 4, 0.0);
+        Context context{pauserequested, world, pipeline};
+        context.ray_counter = 0;
+        for (size_t i = 0; i < Context::accum_buffer_count; ++i) {
+            context.accum_buffers[i].resize(width * height * 4, 0.0f);
+        }
 
         std::shared_ptr<ProcessorControl> this_control_ptr = std::make_shared<ProcessorControl>();
-        for (int i = 0; i < 8; ++i) {
-            Scheduler::register_processor(std::make_shared<NewRaysProcessor>(this_control_ptr, world, pipeline, pauserequested));
+        for (int i = 0; i < 2; ++i) {
+            Scheduler::register_processor(std::make_shared<NewRaysProcessor>(this_control_ptr, context));
         }
-        Scheduler::register_processor(std::make_shared<RetiredRaysProcessor>(this_control_ptr, world, pipeline, ray_counter, accum_buffer));
+        Scheduler::register_processor(std::make_shared<RetiredRaysProcessor>(this_control_ptr, context));
+
+        std::vector<double> total_accum_buffer(width * height * 4);
 
         auto to_pixel_buffer = [&](uint8_t* pixels) {
             for (intptr_t iy = 0; iy < height; ++iy) {
                 uint8_t* line = pixels + iy * width * 4;
                 for (intptr_t ix = 0; ix < width; ++ix) {
                     uint8_t* pixel = line + ix * 4;
-                    double* accum_ptr = accum_buffer.data() + iy * width * 4 + ix * 4;
+                    double* accum_ptr = total_accum_buffer.data() + iy * width * 4 + ix * 4;
                     float r = 0, g = 0, b = 0;
                     if (accum_ptr[3] != 0) {
                         r = (float)(accum_ptr[0] / accum_ptr[3]);
@@ -439,11 +446,21 @@ void RendererThread::ThreadFunc()
         };
 
         uint64_t start_time = GetTickCount64() + 15000;
+        size_t current_accum_index = 0;
 
         while (!rterminate.load(std::memory_order_relaxed)) {
             using namespace std::chrono_literals;
 
             std::this_thread::sleep_for(100ms);
+
+            {
+                std::lock_guard<std::mutex> guard(context.accum_buffer_mutexes[current_accum_index]);
+                for (size_t k = 0; k < total_accum_buffer.size(); ++k) {
+                    total_accum_buffer[k] += context.accum_buffers[current_accum_index][k];
+                    context.accum_buffers[current_accum_index][k] = 0.0f;
+                }
+            }
+            current_accum_index = (current_accum_index + 1) % Context::accum_buffer_count;
 
             {
                 auto& bits = bitbuf.Back();
@@ -461,10 +478,10 @@ void RendererThread::ThreadFunc()
                     "rt | packets: %llu | flushing",
                     pipeline.get_total_packet_count());
             } else {
-                uint64_t counter = ray_counter.load(std::memory_order_relaxed);
+                uint64_t counter = context.ray_counter.load(std::memory_order_relaxed);
                 uint64_t time = GetTickCount64();
                 if (time <= start_time) {
-                    ray_counter.store(0, std::memory_order_relaxed);
+                    context.ray_counter.store(0, std::memory_order_relaxed);
                     snprintf(
                         buf, sizeof(buf),
                         "rt | packets: %llu | warming up (%llus)",
@@ -475,7 +492,7 @@ void RendererThread::ThreadFunc()
                         buf, sizeof(buf),
                         "rt | packets: %llu | Krays per second: %llu",
                         pipeline.get_total_packet_count(),
-                        (counter) / (time - start_time + 1));
+                        counter / (time - start_time + 1));
                 }
             }
             SendMessageTimeoutA(
