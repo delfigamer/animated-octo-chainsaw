@@ -1,5 +1,6 @@
 #include "AlignedBuffer.h"
 #include <windows.h>
+#include <unordered_map>
 
 AlignedBuffer::AlignedBuffer() {
     _size = 0;
@@ -28,7 +29,7 @@ AlignedBuffer::~AlignedBuffer() {
     }
 }
 
-AlignedBuffer& AlignedBuffer::operator=(AlignedBuffer&& other) {
+AlignedBuffer& AlignedBuffer::operator=(AlignedBuffer&& other) noexcept {
     if (_data) {
         VirtualFree(_data, 0, MEM_RELEASE);
     }
@@ -49,4 +50,8 @@ char const* AlignedBuffer::data() const {
 
 size_t AlignedBuffer::size() const {
     return _size;
+}
+
+AlignedBuffer::operator bool() const {
+    return _data != nullptr;
 }

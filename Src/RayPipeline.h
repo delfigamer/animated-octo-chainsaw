@@ -34,63 +34,6 @@ struct RayPipelineParams {
     size_t alignof_packed_triangle() const;
 };
 
-class Ray {
-private:
-    struct NodeReservation {
-        size_t node_index;
-        float min_hit_param;
-
-        static bool compare_node_reservation_greater(NodeReservation const& a, NodeReservation const& b);
-    };
-
-    struct SpaceShear {
-        int kx, ky, kz;
-        float sx, sy, sz;
-        //int rots;
-        //bool refl;
-
-        static SpaceShear make_for(Vec3 dir);
-    };
-
-    size_t _zone_index;
-    Vec3 _origin, _direction, _dir_inverse;
-    SpaceShear _space_shear;
-    float _min_param, _max_param;
-    size_t _hit_triangle_index;
-    Vec3 _hit_triangle_pos;
-    std::vector<NodeReservation> _reservation_min_heap;
-
-    NodeReservation pop_min_reservation();
-    void insert_reservation(size_t node_index, float min_hit_param);
-
-public:
-    friend struct RayPipeline;
-
-    Ray(size_t zone_index, Vec3 origin, Vec3 direction, float min_param = 0.0f, float max_param = HUGE_VALF);
-    Ray(Ray const&) = default;
-    Ray(Ray&&) = default;
-    virtual ~Ray();
-    Ray& operator=(Ray const&) = default;
-    Ray& operator=(Ray&&) = default;
-
-    void reset(size_t zone_index, float min_param = 0.0f, float max_param = HUGE_VALF);
-    void reset(Vec3 direction, float min_param = 0.0f, float max_param = HUGE_VALF);
-    void reset(size_t zone_index, Vec3 direction, float min_param = 0.0f, float max_param = HUGE_VALF);
-    void reset(Vec3 origin, Vec3 direction, float min_param = 0.0f, float max_param = HUGE_VALF);
-    void reset(size_t zone_index, Vec3 origin, Vec3 direction, float min_param = 0.0f, float max_param = HUGE_VALF);
-
-    size_t zone_index() const { return _zone_index; }
-    Vec3 origin() const { return _origin; }
-    Vec3 direction() const { return _direction; }
-    float min_param() const { return _min_param; }
-    float max_param() const { return _max_param; }
-    size_t hit_triangle_index() const { return _hit_triangle_index; }
-    Vec3 hit_triangle_pos() const { return _hit_triangle_pos; }
-    Vec3 hit_point() const { return _origin + _max_param * _direction; }
-
-    virtual void on_completed(std::unique_ptr<Ray>& self_ptr, RayPipeline& pipeline);
-};
-
 struct RayPipeline {
 private:
     struct Internal;
@@ -166,8 +109,6 @@ private:
         void clear();
     };
 
-    //using RayBuffer2 = std::vector<std::unique_ptr<Ray>>;
-
 public:
     struct RayData {
         Vec3 origin, direction;
@@ -215,8 +156,6 @@ private:
         AlignedVec3* vertices;
         void* triangles;
         PackedNode* nodes;
-        //std::vector<std::unique_ptr<RayBuffer2>> ray_buffers_pending;
-        //std::unique_ptr<RayBuffer2> ray_buffer_current;
         RayPacketFunnel pending_funnel;
     };
 
@@ -230,18 +169,34 @@ private:
     };
 
 public:
-    struct Inserter {
-        RayPipeline* pipeline_ptr;
-        Tree* ptree_ptr;
-        size_t zone_id;
-        std::unique_ptr<RayPacket> packet_ptr;
+    class ZoneInserter {
+    private:
+        RayPipeline* _pipeline_ptr;
+        Tree* _ptree_ptr;
+        size_t _zone_id;
+        std::unique_ptr<RayPacket> _packet_ptr;
 
-        Inserter(RayPipeline& pipeline, Tree& ptree);
+    public:
+        ZoneInserter(RayPipeline& pipeline, Tree& ptree);
+        ZoneInserter(ZoneInserter&&) = default;
+        ZoneInserter& operator=(ZoneInserter&&) = default;
+        ~ZoneInserter();
+        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data, float min_param, float max_param);
+        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data);
+    };
+
+    class Inserter {
+    private:
+        RayPipeline* _pipeline_ptr;
+        std::unordered_map<size_t, ZoneInserter> _inserter_map;
+
+    public:
+        Inserter(RayPipeline& pipeline);
         Inserter(Inserter&&) = default;
         Inserter& operator=(Inserter&&) = default;
         ~Inserter();
-        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data, float min_param, float max_param);
-        void schedule(Vec3 origin, Vec3 direction, uint64_t extra_data);
+        void schedule(size_t zone_id, Vec3 origin, Vec3 direction, uint64_t extra_data, float min_param, float max_param);
+        void schedule(size_t zone_id, Vec3 origin, Vec3 direction, uint64_t extra_data);
     };
 
 private:
@@ -265,17 +220,9 @@ public:
 
     std::unique_ptr<RayPacket> create_ray_packet(size_t zone_id);
     void collect_ray_packet_spare(std::unique_ptr<RayPacket> packet_ptr);
-    //std::unique_ptr<RayBuffer2> create_ray_buffer_2();
 
-    void trace_immediately(Ray& ray);
-    //void schedule(std::unique_ptr<Ray> ray_ptr);
-    //void flush();
-
-    //void schedule(Tree& ptree, RayData ray_data);
-    //void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data, float min_param, float max_param);
-    //void schedule(size_t zone_id, Vec3 origin, Vec3 direction, void* extra_data);
-
-    Inserter inserter(size_t zone_id);
+    ZoneInserter zone_inserter(size_t zone_id);
+    Inserter inserter();
 
     bool completed_packets_empty();
     std::unique_ptr<RayPacket> pop_completed_packet();

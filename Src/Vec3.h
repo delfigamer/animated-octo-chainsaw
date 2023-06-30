@@ -14,11 +14,22 @@ struct Vec3 {
     float operator[](size_t i) const {
         return ((float*)this)[i];
     }
+
+    Vec3& operator+=(Vec3 other) {
+        x += other.x;
+        y += other.y;
+        z += other.z;
+        return *this;
+    }
 };
 
 struct Xform3 {
     Vec3 offset, xc, yc, zc;
 };
+
+inline Vec3 operator-(Vec3 b) {
+    return Vec3{-b.x, -b.y, -b.z};
+}
 
 inline Vec3 operator+(Vec3 a, Vec3 b) {
     return Vec3{a.x + b.x, a.y + b.y, a.z + b.z};
@@ -48,8 +59,22 @@ inline float dotsqr(Vec3 a) {
     return dot(a, a);
 }
 
+inline float length(Vec3 a) {
+    return sqrtf(dotsqr(a));
+}
+
 inline Vec3 norm(Vec3 a) {
     return (1.0f / sqrtf(dotsqr(a))) * a;
+}
+
+inline void assign_elementwise_product(Vec3& a, Vec3 b) {
+    a.x *= b.x;
+    a.y *= b.y;
+    a.z *= b.z;
+}
+
+inline Vec3 elementwise_product(Vec3 a, Vec3 b) {
+    return Vec3{a.x * b.x, a.y * b.y, a.z * b.z};
 }
 
 inline Vec3 elementwise_inverse(Vec3 a) {

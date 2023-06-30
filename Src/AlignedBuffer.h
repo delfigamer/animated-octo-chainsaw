@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <atomic>
+#include <forward_list>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -18,238 +19,195 @@ public:
     AlignedBuffer(size_t size);
     AlignedBuffer(AlignedBuffer&& other) noexcept;
     ~AlignedBuffer();
-    AlignedBuffer& operator=(AlignedBuffer&& other);
+    AlignedBuffer& operator=(AlignedBuffer&& other) noexcept;
 
     char* data();
     char const* data() const;
     size_t size() const;
+    explicit operator bool() const;
+};
+
+struct iref {
+    int& ir;
+    iref(int& ir)
+        : ir(ir)
+    {
+    }
 };
 
 template<typename T, size_t BS = 1024>
 class Arena {
-    static constexpr size_t block_size = BS;
-
-    static_assert(std::is_trivial_v<T>);
-    static_assert(1 <= block_size && block_size < 0x1000000);
-
 private:
-    struct Block {
-        AlignedBuffer buffer;
-        std::atomic<size_t> use_count;
-
-        Block()
-            : buffer(block_size * sizeof(T))
-            , use_count(0)
-        {
-        }
-
-        T* data() {
-            return (T*)buffer.data();
-        }
-
-        T const* data() const {
-            return (T const*)buffer.data();
-        }
-
-        T& operator[](size_t index) {
-            return data()[index];
-        }
-
-        T const& operator[](size_t index) const {
-            return data()[index];
-        }
-
-        //size_t increment_use_count(size_t delta) {
-        //    return _use_count.fetch_add(delta, std::memory_order_release) + delta;
-        //}
-        //
-        //size_t decrement_use_count(size_t delta) {
-        //    return _use_count.fetch_sub(delta, std::memory_order_release) - delta;
-        //}
-        //
-        //size_t use_count() const {
-        //    _use_count.load(std::memory_order_acquire);
-        //}
-    };
+    static constexpr size_t block_capacity = BS;
+    static constexpr size_t block_byte_size = block_capacity * sizeof(T);
+    
+    static_assert(std::is_trivially_destructible_v<T>);
+    static_assert(1 <= block_capacity && block_capacity < 0x1000000);
 
     std::mutex _mutex;
-    std::vector<Block*> _block_list;
-    std::vector<size_t> _empty_block_index_list;
-
-    void get_empty_block(Block*& block_ptr, size_t& block_index) {
+    std::vector<AlignedBuffer> _block_list;
+    size_t _used_block_count;
+    
+    void create_empty_block(T*& block_data_ptr, size_t& block_index) {
         std::lock_guard guard(_mutex);
-        if (_empty_block_index_list.empty()) {
-            std::unique_ptr<Block> new_block_owning_ptr = std::make_unique<Block>();
-            block_ptr = new_block_owning_ptr.get();
-            block_index = _block_list.size();
-            _block_list.push_back(new_block_owning_ptr.release());
+        if (_used_block_count < _block_list.size()) {
+            block_index = _used_block_count;
+            block_data_ptr = (T*)_block_list[block_index].data();
         } else {
-            block_index = _empty_block_index_list.back();
-            _empty_block_index_list.pop_back();
-            block_ptr = _block_list[block_index];
+            block_index = _block_list.size();
+            block_data_ptr = (T*)_block_list.emplace_back(block_byte_size).data();
         }
+        _used_block_count = block_index + 1;
     }
-
+    
 public:
     Arena() {
     }
 
     ~Arena() {
-        for (Block* block_ptr : _block_list) {
-            delete block_ptr;
-        }
+    }
+
+    void clear() {
+        std::lock_guard guard(_mutex);
+        _used_block_count = 0;
     }
 
     class Allocator {
     private:
         Arena* _arena_ptr;
-        Block* _current_block_ptr;
+        T* _current_block_data_ptr;
         size_t _current_block_index;
         size_t _current_local_index;
-
+    
     public:
         Allocator() {
             _arena_ptr = nullptr;
-            _current_block_ptr = nullptr;
+            _current_block_data_ptr = nullptr;
         }
-
+    
         Allocator(Arena& arena) {
             _arena_ptr = &arena;
-            _current_block_ptr = nullptr;
+            _current_block_data_ptr = nullptr;
         }
-
+    
         Allocator(Allocator&& other) {
             _arena_ptr = other._arena_ptr;
-            _current_block_ptr = other._current_block_ptr;
+            _current_block_data_ptr = other._current_block_data_ptr;
             _current_block_index = other._current_block_index;
             _current_local_index = other._current_local_index;
-            other._current_block_ptr = nullptr;
+            other._current_block_data_ptr = nullptr;
         }
-
+    
         Allocator& operator=(Allocator&& other) {
             _arena_ptr = other._arena_ptr;
-            _current_block_ptr = other._current_block_ptr;
+            _current_block_data_ptr = other._current_block_data_ptr;
             _current_block_index = other._current_block_index;
             _current_local_index = other._current_local_index;
-            other._current_block_ptr = nullptr;
+            other._current_block_data_ptr = nullptr;
             return *this;
         }
-
+    
         ~Allocator() {
         }
-
-        T& alloc(uint64_t& composite_index) {
-            if (!_current_block_ptr) {
+    
+        template<typename... As>
+        T& emplace(uint64_t& composite_index, As&&... args) {
+            if (!_current_block_data_ptr) {
                 if (!_arena_ptr) {
                     throw std::runtime_error("Allocator is not assigned to an Arena");
                 }
-                _arena_ptr->get_empty_block(_current_block_ptr, _current_block_index);
+                _arena_ptr->create_empty_block(_current_block_data_ptr, _current_block_index);
                 _current_local_index = 0;
             }
-            composite_index = _current_block_index * block_size + _current_local_index;
-            T& elem = (*_current_block_ptr)[_current_local_index];
-            _current_block_ptr->use_count.fetch_add(1, std::memory_order_acquire);
+            composite_index = _current_block_index * block_capacity + _current_local_index;
+            T* elem_ptr = _current_block_data_ptr + _current_local_index;
+            new (elem_ptr) T(std::forward<As>(args)...);
             _current_local_index += 1;
-            if (_current_local_index >= block_size) {
-                _current_block_ptr = nullptr;
+            if (_current_local_index >= block_capacity) {
+                _current_block_data_ptr = nullptr;
             }
-            return elem;
+            return *elem_ptr;
+        }
+
+        explicit operator bool() const {
+            return _arena_ptr != nullptr;
         }
     };
-
+    
     Allocator allocator() {
         return Allocator(*this);
     }
-
+    
     class View {
     private:
         Arena* _arena_ptr;
         /*  A copy of _arena_ptr->_block_list, so that the view does not get invalidated
             if _arena_ptr->get_empty_block extends the list and causes a reallocation. */
-        std::vector<Block*> _block_list;
-        std::vector<size_t> _pending_decrements;
-
+        std::vector<T*> _block_data_ptr_list;
+    
     public:
+        View() {
+            _arena_ptr = nullptr;
+        }
+
         View(Arena& arena) {
             _arena_ptr = &arena;
         }
-
+    
         View(View const& other) {
             _arena_ptr = other._arena_ptr;
         }
-
+    
         View(View&& other) {
             _arena_ptr = other._arena_ptr;
-            _block_list = std::move(other._block_list);
-            _pending_decrements = std::move(other._pending_decrements);
-            other._pending_decrements.clear();
+            _block_data_ptr_list = std::move(other._block_data_ptr_list);
         }
-
+    
         View& operator=(View const& other) {
             if (_arena_ptr != other._arena_ptr) {
-                commit_decrements();
                 _arena_ptr = other._arena_ptr;
-                _block_list.clear();
-                _pending_decrements.clear();
+                _block_data_ptr_list.clear();
             }
             return *this;
         }
-
+    
         View& operator=(View&& other) {
             if (_arena_ptr != other._arena_ptr) {
-                commit_decrements();
                 _arena_ptr = other._arena_ptr;
-                _block_list = std::move(other._block_list);
-                _pending_decrements = std::move(other._pending_decrements);
-                other._pending_decrements.clear();
+                _block_data_ptr_list = std::move(other._block_data_ptr_list);
             }
             return *this;
         }
-
+    
         ~View() {
-            commit_decrements();
         }
-
-        T& operator[](uint64_t composite_index) {
-            size_t block_index = composite_index / block_size;
-            size_t local_index = composite_index % block_size;
-            if (block_index >= _block_list.size()) {
+    
+        void ensure_block_present(size_t block_index) {
+            if (block_index >= _block_data_ptr_list.size()) {
                 std::lock_guard<std::mutex> guard(_arena_ptr->_mutex);
-                _block_list = _arena_ptr->_block_list; // copy
-                _pending_decrements.resize(_block_list.size(), 0);
-            }
-            if (block_index >= _block_list.size()) {
-                throw std::runtime_error("invalid index for an Arena::View");
-            }
-            return (*_block_list[block_index])[local_index];
-        }
-
-        void schedule_decrement(uint64_t composite_index) {
-            size_t block_index = composite_index / block_size;
-            if (block_index >= _block_list.size()) {
-                throw std::runtime_error("invalid index for an Arena::View");
-            }
-            _pending_decrements[block_index] += 1;
-        }
-
-        void commit_decrements() {
-            std::unique_lock<std::mutex> guard(_arena_ptr->_mutex, std::defer_lock);
-            for (size_t block_index = 0; block_index < _pending_decrements.size(); ++block_index) {
-                size_t delta = _pending_decrements[block_index];
-                if (delta != 0) {
-                    size_t old_use_count = _block_list[block_index]->use_count.fetch_sub(delta, std::memory_order_release);
-                    if (old_use_count == delta) {
-                        if (!guard.owns_lock()) {
-                            guard.lock();
-                        }
-                        _arena_ptr->_empty_block_index_list.push_back(block_index);
-                    }
-                    _pending_decrements[block_index] = 0;
+                size_t old_size = _block_data_ptr_list.size();
+                _block_data_ptr_list.resize(_arena_ptr->_block_list.size());
+                for (size_t i = old_size; i < _block_data_ptr_list.size(); ++i) {
+                    _block_data_ptr_list[i] = (T*)_arena_ptr->_block_list[i].data();
+                }
+                if (block_index >= _block_data_ptr_list.size()) {
+                    throw std::runtime_error("invalid index for an Arena::View");
                 }
             }
         }
-    };
+    
+        T& operator[](uint64_t composite_index) {
+            size_t block_index = composite_index / block_capacity;
+            size_t local_index = composite_index % block_capacity;
+            ensure_block_present(block_index);
+            return _block_data_ptr_list[block_index][local_index];
+        }
 
+        explicit operator bool() const {
+            return _arena_ptr != nullptr;
+        }
+    };
+    
     View view() {
         return View(*this);
     }
