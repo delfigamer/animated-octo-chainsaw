@@ -153,6 +153,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             rtt->SetPause(false);
             break;
         }
+        case IDM_STEP:
+        {
+            RendererThread* rtt = (RendererThread*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+            rtt->Step();
+            break;
+        }
         default:
             return DefWindowProc(hWnd, message, wParam, lParam);
         }

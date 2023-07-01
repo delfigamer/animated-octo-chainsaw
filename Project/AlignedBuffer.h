@@ -46,18 +46,33 @@ private:
 
     std::mutex _mutex;
     std::vector<AlignedBuffer> _block_list;
+    std::vector<std::pair<size_t, size_t>> _partial_blocks;
     size_t _used_block_count;
     
-    void create_empty_block(T*& block_data_ptr, size_t& block_index) {
+    void get_free_block(T*& block_data_ptr, size_t& block_index, size_t& next_local_index) {
         std::lock_guard guard(_mutex);
-        if (_used_block_count < _block_list.size()) {
+        if (!_partial_blocks.empty()) {
+            std::pair<size_t, size_t> partial = _partial_blocks.back();
+            block_index = partial.first;
+            block_data_ptr = (T*)_block_list[block_index].data();
+            next_local_index = partial.second;
+            _partial_blocks.pop_back();
+        } else if (_used_block_count < _block_list.size()) {
             block_index = _used_block_count;
             block_data_ptr = (T*)_block_list[block_index].data();
+            next_local_index = 0;
+            _used_block_count = block_index + 1;
         } else {
             block_index = _block_list.size();
             block_data_ptr = (T*)_block_list.emplace_back(block_byte_size).data();
+            next_local_index = 0;
+            _used_block_count = block_index + 1;
         }
-        _used_block_count = block_index + 1;
+    }
+    
+    void store_partial_block(size_t block_index, size_t next_local_index) {
+        std::lock_guard guard(_mutex);
+        _partial_blocks.emplace_back(block_index, next_local_index);
     }
     
 public:
@@ -69,6 +84,7 @@ public:
 
     void clear() {
         std::lock_guard guard(_mutex);
+        _partial_blocks.clear();
         _used_block_count = 0;
     }
 
@@ -108,6 +124,9 @@ public:
         }
     
         ~Allocator() {
+            if (_current_block_data_ptr && _current_local_index < block_capacity) {
+                _arena_ptr->store_partial_block(_current_block_index, _current_local_index);
+            }
         }
     
         template<typename... As>
@@ -116,8 +135,7 @@ public:
                 if (!_arena_ptr) {
                     throw std::runtime_error("Allocator is not assigned to an Arena");
                 }
-                _arena_ptr->create_empty_block(_current_block_data_ptr, _current_block_index);
-                _current_local_index = 0;
+                _arena_ptr->get_free_block(_current_block_data_ptr, _current_block_index, _current_local_index);
             }
             composite_index = _current_block_index * block_capacity + _current_local_index;
             T* elem_ptr = _current_block_data_ptr + _current_local_index;

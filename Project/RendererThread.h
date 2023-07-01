@@ -15,6 +15,7 @@ private:
     std::atomic<bool> rterminate;
     std::atomic<bool> exportrequested;
     std::atomic<bool> pauserequested;
+    std::atomic<bool> steprequested;
 
     void ThreadFunc();
 
@@ -26,5 +27,6 @@ public:
     void DrawFrame(HDC dc);
     void Export();
     void SetPause(bool value);
+    void Step();
 };
 
