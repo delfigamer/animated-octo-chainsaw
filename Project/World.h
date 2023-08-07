@@ -18,7 +18,9 @@ struct World {
         int vertex_indexes[3];
         int normal_index;
         int surface_index;
-        int other_zone_index;
+        int other_zone_id;
+        int zone_id;
+        float area;
     };
 
     struct Box {
@@ -32,7 +34,7 @@ struct World {
     };
 
     struct Tree {
-        std::vector<Triangle> triangles;
+        size_t triangle_index_offset;
         std::vector<std::vector<Box>> node_boxes;
         std::vector<std::vector<size_t>> node_children_indexes;
     };
@@ -45,10 +47,11 @@ struct World {
     std::vector<Surface> surfaces;
     std::vector<Vec3> vertices;
     std::vector<Vec3> normals;
+    std::vector<Triangle> triangles;
     std::vector<Tree> zone_trees;
     size_t zone_at_infinity;
 
-    size_t zone_index_at(Vec3 pos) const;
+    size_t zone_id_at(Vec3 pos) const;
 };
 
 World load_world(std::string const& path);

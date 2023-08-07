@@ -1,7 +1,5 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <math.h>
 
 struct Vec3 {
@@ -26,6 +24,10 @@ struct Vec3 {
 struct Xform3 {
     Vec3 offset, xc, yc, zc;
 };
+
+inline bool operator==(Vec3 a, Vec3 b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
 
 inline Vec3 operator-(Vec3 b) {
     return Vec3{-b.x, -b.y, -b.z};
@@ -79,6 +81,11 @@ inline Vec3 elementwise_product(Vec3 a, Vec3 b) {
 
 inline Vec3 elementwise_inverse(Vec3 a) {
     return Vec3{1.0f / a.x, 1.0f / a.y, 1.0f / a.z};
+}
+
+template<typename F>
+inline Vec3 elementwise_map(F f, Vec3 a) {
+    return Vec3{f(a.x), f(a.y), f(a.z)};
 }
 
 inline float det3(Vec3 a, Vec3 b, Vec3 c) {

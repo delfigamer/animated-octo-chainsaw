@@ -81,7 +81,7 @@ namespace {
             auto normal_count = f.read<int32_t>();
             world.normals.resize(normal_count);
             for (int i = 0; i < normal_count; ++i) {
-                world.normals[i] = f.read<Vec3>();
+                world.normals[i] = norm(f.read<Vec3>());
             }
         }
         
@@ -114,21 +114,23 @@ namespace {
             }
         }
         
-        World::Box load_tree_node_leaf(World::Tree& tree) {
-            World::Triangle& tri = tree.triangles.emplace_back();
+        World::Box load_tree_node_leaf(World::Tree& tree, size_t zone_id) {
+            World::Triangle& tri = world.triangles.emplace_back();
             Vec3 a, b, c;
             read_vertex(tri.vertex_indexes[0], a);
             read_vertex(tri.vertex_indexes[1], b);
             read_vertex(tri.vertex_indexes[2], c);
             read_normal_index(tri.normal_index);
             read_surface_index(tri.surface_index);
-            read_zone_index(tri.other_zone_index);
+            read_zone_index(tri.other_zone_id);
+            tri.zone_id = zone_id;
+            tri.area = 0.5f * length(cross(b - a, c - a));
             World::Box tri_box = triangle_box(a, b, c);
             tree.node_boxes[0].push_back(tri_box);
             return tri_box;
         }
         
-        World::Box load_tree_node_branch(World::Tree& tree, int level) {
+        World::Box load_tree_node_branch(World::Tree& tree, size_t zone_id, int level) {
             size_t children_count = f.read<int32_t>();
             World::Box node_box = null_box();
             for (int i = 0; i < children_count; ++i) {
@@ -136,7 +138,7 @@ namespace {
                 if (child_level != level - 1) {
                     throw std::runtime_error("Invalid tree structure");
                 }
-                World::Box child_box = load_tree_node(tree, child_level);
+                World::Box child_box = load_tree_node(tree, zone_id, child_level);
                 box_union_with(node_box, child_box);
             }
             tree.node_boxes[level].push_back(node_box);
@@ -144,23 +146,24 @@ namespace {
             return node_box;
         }
         
-        World::Box load_tree_node(World::Tree& tree, int level) {
+        World::Box load_tree_node(World::Tree& tree, size_t zone_id, int level) {
             if (level == 0) {
-                return load_tree_node_leaf(tree);
+                return load_tree_node_leaf(tree, zone_id);
             } else {
-                return load_tree_node_branch(tree, level);
+                return load_tree_node_branch(tree, zone_id, level);
             }
         }
 
-        World::Tree load_triangle_tree() {
+        World::Tree load_triangle_tree(size_t zone_id) {
             World::Tree tree;
+            tree.triangle_index_offset = world.triangles.size();
             auto root_level = f.read<int32_t>();
             tree.node_boxes.resize(root_level + 1);
             tree.node_children_indexes.resize(root_level);
             for (size_t i = 0; i < root_level; ++i) {
                 tree.node_children_indexes[i].push_back(0);
             }
-            load_tree_node(tree, root_level);
+            load_tree_node(tree, zone_id, root_level);
             tree.node_boxes[0].shrink_to_fit();
             for (size_t i = 0; i < root_level; ++i) {
                 tree.node_boxes[i + 1].shrink_to_fit();
@@ -174,7 +177,7 @@ namespace {
             world.zone_trees.resize(zone_count);
             for (size_t i = 0; i < zone_count; ++i) {
                 auto zone_flags = f.read<uint32_t>();
-                world.zone_trees[i] = load_triangle_tree();
+                world.zone_trees[i] = load_triangle_tree(i);
                 if (zone_flags & 1) {
                     world.zone_at_infinity = i;
                 }
@@ -191,7 +194,7 @@ namespace {
             box.min.z <= pos.z && pos.z <= box.max.z
         ) {
             if (node_level == 0) {
-                World::Triangle const& tri = tree.triangles[node_index];
+                World::Triangle const& tri = world.triangles[tree.triangle_index_offset + node_index];
                 Vec3 a = world.vertices[tri.vertex_indexes[0]] - pos;
                 Vec3 b = world.vertices[tri.vertex_indexes[1]] - pos;
                 Vec3 c = world.vertices[tri.vertex_indexes[2]] - pos;
@@ -221,7 +224,7 @@ namespace {
     }
 }
 
-size_t World::zone_index_at(Vec3 pos) const {
+size_t World::zone_id_at(Vec3 pos) const {
     size_t current_zone = zone_at_infinity;
     float current_x = HUGE_VALF;
     for (size_t i = 0; i < zone_trees.size(); ++i) {
@@ -264,13 +267,14 @@ World load_test_world() {
         Vec3{100, 0,  100},
         Vec3{-100, 0,  100},
     };
-    world.zone_trees.resize(1);
-    world.zone_trees[0].triangles = std::vector{
+    world.triangles = std::vector{
         World::Triangle{{0, 1, 2}, 0},
         World::Triangle{{2, 1, 0}, 0},
         World::Triangle{{0, 2, 3}, 0},
         World::Triangle{{3, 2, 0}, 0},
     };
+    world.zone_trees.resize(1);
+    world.zone_trees[0].triangle_index_offset = 0;
     world.zone_trees[0].node_boxes.resize(2);
     world.zone_trees[0].node_boxes[0] = std::vector{
         World::Box{{-100, -50, -100}, {100, 50, 100}},

@@ -60,7 +60,7 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <PreprocessorDefinitions>_DEBUG;_WINDOWS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalOptions>-mavx2 -mfma -mllvm -x86-use-vzeroupper=0 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-mavx2 -mfma -mllvm -x86-use-vzeroupper=0 -Wno-logical-op-parentheses %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
@@ -78,7 +78,7 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <PreprocessorDefinitions>NDEBUG;_WINDOWS;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalOptions>-mavx2 -mfma -mllvm -x86-use-vzeroupper=0 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-mavx2 -mfma -mllvm -x86-use-vzeroupper=0 -Wno-logical-op-parentheses %(AdditionalOptions)</AdditionalOptions>
       <LanguageStandard>stdcpp20</LanguageStandard>
     </ClCompile>
     <Link>
@@ -93,6 +93,7 @@
     <ClInclude Include="AlignedBuffer.h" />
     <ClInclude Include="BidirSampler.h" />
     <ClInclude Include="Camera.h" />
+    <ClInclude Include="Color.h" />
     <ClInclude Include="Entry.h" />
     <ClInclude Include="FlagLock.h" />
     <ClInclude Include="ForwardSampler.h" />
@@ -100,6 +101,7 @@
     <ClInclude Include="header.h" />
     <ClInclude Include="FLin.h" />
     <ClInclude Include="ParameterSampler.h" />
+    <ClInclude Include="Random.h" />
     <ClInclude Include="RayPipeline.h" />
     <ClInclude Include="SamplerBase.h" />
     <ClInclude Include="RendererThread.h" />
@@ -121,6 +123,7 @@
     <ClCompile Include="ForwardSampler.cpp" />
     <ClCompile Include="Geometry.cpp" />
     <ClCompile Include="ParameterSampler.cpp" />
+    <ClCompile Include="Random.cpp" />
     <ClCompile Include="RayPipeline.cpp" />
     <ClCompile Include="SamplerBase.cpp" />
     <ClCompile Include="RendererThread.cpp" />

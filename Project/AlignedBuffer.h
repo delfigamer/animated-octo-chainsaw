@@ -16,7 +16,7 @@ private:
 
 public:
     AlignedBuffer();
-    AlignedBuffer(size_t size);
+    explicit AlignedBuffer(size_t size);
     AlignedBuffer(AlignedBuffer&& other) noexcept;
     ~AlignedBuffer();
     AlignedBuffer& operator=(AlignedBuffer&& other) noexcept;
@@ -48,6 +48,7 @@ private:
     std::vector<AlignedBuffer> _block_list;
     std::vector<std::pair<size_t, size_t>> _partial_blocks;
     size_t _used_block_count;
+    size_t _active_allocator_count;
     
     void get_free_block(T*& block_data_ptr, size_t& block_index, size_t& next_local_index) {
         std::lock_guard guard(_mutex);
@@ -68,15 +69,23 @@ private:
             next_local_index = 0;
             _used_block_count = block_index + 1;
         }
+        _active_allocator_count += 1;
     }
     
-    void store_partial_block(size_t block_index, size_t next_local_index) {
+    void return_partial_block(size_t block_index, size_t next_local_index) {
         std::lock_guard guard(_mutex);
         _partial_blocks.emplace_back(block_index, next_local_index);
+        _active_allocator_count -= 1;
+    }
+    
+    void return_full_block() {
+        std::lock_guard guard(_mutex);
+        _active_allocator_count -= 1;
     }
     
 public:
     Arena() {
+        _active_allocator_count = 0;
     }
 
     ~Arena() {
@@ -84,6 +93,9 @@ public:
 
     void clear() {
         std::lock_guard guard(_mutex);
+        if (_active_allocator_count != 0) {
+            throw std::runtime_error("clearing an Arena that has active allocators");
+        }
         _partial_blocks.clear();
         _used_block_count = 0;
     }
@@ -124,9 +136,7 @@ public:
         }
     
         ~Allocator() {
-            if (_current_block_data_ptr && _current_local_index < block_capacity) {
-                _arena_ptr->store_partial_block(_current_block_index, _current_local_index);
-            }
+            release();
         }
     
         template<typename... As>
@@ -142,6 +152,7 @@ public:
             new (elem_ptr) T(std::forward<As>(args)...);
             _current_local_index += 1;
             if (_current_local_index >= block_capacity) {
+                _arena_ptr->return_full_block();
                 _current_block_data_ptr = nullptr;
             }
             return *elem_ptr;
@@ -149,6 +160,17 @@ public:
 
         explicit operator bool() const {
             return _arena_ptr != nullptr;
+        }
+
+        void release() {
+            if (_current_block_data_ptr) {
+                if (_current_local_index < block_capacity) {
+                    _arena_ptr->return_partial_block(_current_block_index, _current_local_index);
+                } else {
+                    _arena_ptr->return_full_block();
+                }
+                _current_block_data_ptr = nullptr;
+            }
         }
     };
     

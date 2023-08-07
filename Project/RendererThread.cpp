@@ -1,31 +1,26 @@
 #include "RendererThread.h"
-#include "World.h"
+#include "Color.h"
 #include "RayPipeline.h"
+#include "Random.h"
 #include "Threading.h"
+#include "World.h"
 //#include <png.h>
+
+//#pragma optimize( "", off )
 
 constexpr int width = 1600;
 constexpr int height = 900;
-constexpr int lines_per_epoch = 100;
-constexpr int epochs_per_frame = (height + lines_per_epoch - 1) / lines_per_epoch;
-constexpr int light_samples_per_epoch = lines_per_epoch * 1600;
+constexpr int pixels_per_epoch = 0x400;
+constexpr int epochs_per_frame = (width * height + pixels_per_epoch - 1) / pixels_per_epoch;
+constexpr int light_samples_per_epoch = pixels_per_epoch;
+constexpr int connections_per_lens_sample = 4;
+//constexpr int light_samples_per_epoch = 1;
 //constexpr float exposure = 0.5f;
 constexpr float exposure = 70.0f;
 constexpr float accum_num_scale = 10000000.0f;
-constexpr float accum_den_scale = 10.0f * width * height;
+constexpr float accum_den_scale = 100.0f * width * height * epochs_per_frame;
 
 constexpr float pi = 3.141593f;
-
-static size_t ceil_log2(size_t x) {
-    if (x > ((size_t)(-1) >> 1)) {
-        throw std::runtime_error("rounding up to a power of 2 would result in overflow");
-    }
-    size_t r = 1;
-    while (r < x) {
-        r <<= 1;
-    }
-    return r;
-}
 
 static uint8_t tonemap_curve(float x) {
     float t;
@@ -38,169 +33,18 @@ static uint8_t tonemap_curve(float x) {
     return b;
 }
 
-static void tonemap(float va, float vb, float vc, uint8_t* pixel)
+static void tonemap(Color v, uint8_t* pixel)
 {
-    pixel[0] = tonemap_curve(vc);
-    pixel[1] = tonemap_curve(vb);
-    pixel[2] = tonemap_curve(va);
+    pixel[0] = tonemap_curve(v[2]);
+    pixel[1] = tonemap_curve(v[1]);
+    pixel[2] = tonemap_curve(v[0]);
     pixel[3] = 255;
 }
 
-struct Random {
-    uint64_t state = 0x4d595df4d0f33173u;
-    static constexpr uint64_t multiplier = 6364136223846793005u;
-    static constexpr uint64_t increment = 1442695040888963407u;
-
-    static uint32_t rotr32(uint32_t x, unsigned r) {
-        return x >> r | x << ((32 - r) & 31);
-    }
-
-    void uniform(uint32_t& r) {
-        uint64_t x = state;
-        unsigned count = (unsigned)(x >> 59);
-        state = x * multiplier + increment;
-        x ^= x >> 18;
-        r = rotr32((uint32_t)(x >> 27), count);
-    }
-
-    void uniform(float& q) {
-        uint32_t u;
-        uniform(u);
-        q = 0x1p-32f * (float)u;
-    }
-
-    void triangle(float& u) {
-        float q1, q2;
-        uniform(q1);
-        uniform(q2);
-        u = q1 - q2;
-    }
-
-    /* normal distribution with stddev 1 */
-    void gauss(float& u) {
-        float q;
-        u = 0;
-        for (int i = 0; i < 6*9; ++i) {
-            triangle(q);
-            u += q;
-        }
-        u *= (1.0f / 3.0f);
-    }
-
-    void circle(float& u, float& v) {
-        while (true) {
-            uniform(u);
-            u = u * 2.0f - 1.0f;
-            uniform(v);
-            v = v * 2.0f - 1.0f;
-            float uvsqr = u * u + v * v;
-            if (uvsqr > 1.0f) {
-                continue;
-            }
-            float inv = 1.0f / sqrtf(uvsqr);
-            u *= inv;
-            v *= inv;
-            return;
-        }
-    }
-
-    void lambert(Vec3 const& n, Vec3& d) {
-        Vec3 a{1, 0, 0};
-        if (n.x > 0.8f || n.x < -0.8f) {
-            a = Vec3{0, 1, 0};
-        }
-        Vec3 b = norm(cross(a, n));
-        Vec3 t = norm(cross(b, n));
-        float q;
-        uniform(q);
-        float z = sqrtf(q);
-        float r = sqrtf(1.0f - q);
-        float u;
-        float v;
-        circle(u, v);
-        u *= r;
-        v *= r;
-        d = z * n + u * b + v * t;
-    }
-
-    void p(float beta, bool& r) {
-        float q;
-        uniform(q);
-        r = q < beta;
-    }
-};
-
-struct DiscreteDistribution {
-    struct Elem {
-        size_t alt;
-        uint32_t threshold;
-    };
-
-    std::vector<Elem> elems;
-
-    static DiscreteDistribution make(std::vector<float> const& input_weights) {
-        constexpr uint64_t cp_unit = (uint64_t)1 << 32;
-        size_t size = ceil_log2(input_weights.size());
-        float total_weight = 0.0f;
-        for (size_t i = 0; i < input_weights.size(); ++i) {
-            total_weight += input_weights[i];
-        }
-        std::vector<uint64_t> scaled_commit_probabilities(size);
-        std::vector<size_t> overfull_indices;
-        std::vector<size_t> underfull_indices;
-        float probability_scale = (float)cp_unit * (float)size / total_weight;
-        for (size_t i = 0; i < input_weights.size(); ++i) {
-            scaled_commit_probabilities[i] = probability_scale * input_weights[i];
-            if (scaled_commit_probabilities[i] < cp_unit) {
-                underfull_indices.push_back(i);
-            } else {
-                if (scaled_commit_probabilities[i] > cp_unit) {
-                    overfull_indices.push_back(i);
-                }
-            }
-        }
-        for (size_t i = input_weights.size(); i < size; ++i) {
-            scaled_commit_probabilities[i] = 0;
-            underfull_indices.push_back(i);
-        }
-        std::vector<Elem> elems(size);
-        for (size_t i = 0; i < size; ++i) {
-            elems[i].alt = i;
-            elems[i].threshold = 0xffffffff;
-        }
-        while (!overfull_indices.empty() && !underfull_indices.empty()) {
-            size_t next_overfull = overfull_indices.back();
-            size_t next_underfull = underfull_indices.back();
-            underfull_indices.pop_back();
-            uint64_t delta = cp_unit - scaled_commit_probabilities[next_underfull];
-            scaled_commit_probabilities[next_overfull] -= delta;
-            elems[next_underfull].alt = next_overfull;
-            elems[next_underfull].threshold = cp_unit - delta;
-            if (scaled_commit_probabilities[next_overfull] <= cp_unit) {
-                overfull_indices.pop_back();
-                if (scaled_commit_probabilities[next_overfull] < cp_unit) {
-                    underfull_indices.push_back(next_overfull);
-                }
-            }
-        }
-        return DiscreteDistribution{std::move(elems)};
-    }
-
-    void sample(Random& random, size_t& result) {
-        uint32_t qi, qa;
-        random.uniform(qi);
-        result = qi & (elems.size() - 1);
-        random.uniform(qa);
-        if (qa >= elems[result].threshold) {
-            result = elems[result].alt;
-        }
-    }
-};
-
 struct Surface {
     Vec3 normal;
-    Vec3 albedo = Vec3{0, 0, 0};
-    Vec3 emission = Vec3{0, 0, 0};
+    Color albedo = Color{0, 0, 0};
+    Color emission = Color{0, 0, 0};
 
     static Surface black(Vec3 normal) {
         Surface m;
@@ -211,18 +55,18 @@ struct Surface {
     static Surface emissive(Vec3 normal, float ex, float ey, float ez) {
         Surface m;
         m.normal = normal;
-        m.emission = Vec3{ex, ey, ez};
+        m.emission = Color{ex, ey, ez};
         return m;
     }
 
     static Surface diffuse(Vec3 normal, float ax, float ay, float az) {
         Surface m;
         m.normal = normal;
-        m.albedo = Vec3{ax, ay, az};
+        m.albedo = Color{ax, ay, az};
         return m;
     }
 
-    Vec3 emission_flux_density(Vec3 lens_dir) const {
+    Color emission_flux_density(Vec3 lens_dir) const {
         return emission;
     }
 
@@ -230,20 +74,26 @@ struct Surface {
         return 1.0f / pi;
     }
 
-    void sample_emission(Random& random, Vec3& light_dir, Vec3& result_value) const {
+    void sample_emission(Random& random, Vec3& light_dir, Color& result_value) const {
         random.lambert(normal, light_dir);
         result_value = pi * emission;
     }
 
-    float scatter_event_probability_from_lens(Vec3 lens_dir) const {
-        return fmaxf(fmaxf(albedo.x, albedo.y), albedo.z);
+    float scatter_event_probability_from_lens(int path_length, Vec3 lens_dir) const {
+        if (path_length <= 4) {
+            return 1.0f;
+        } else {
+            float p = elementwise_foldl1(fmaxf, albedo);
+            float q = 1.0f - p;
+            return 1.0f - q*q;
+        }
     }
 
-    float scatter_event_probability_from_light(Vec3 lens_dir) const {
-        return scatter_event_probability_from_lens(lens_dir);
+    float scatter_event_probability_from_light(int path_length, Vec3 lens_dir) const {
+        return scatter_event_probability_from_lens(path_length, lens_dir);
     }
 
-    Vec3 scatter_flux_density(Vec3 lens_dir, Vec3 light_dir) const {
+    Color scatter_flux_density(Vec3 lens_dir, Vec3 light_dir) const {
         return (1.0f / pi) * albedo;
     }
 
@@ -251,19 +101,65 @@ struct Surface {
         return 1.0f / pi;
     }
 
-    void sample_scatter_from_lens(Random& random, Vec3 lens_dir, Vec3& light_dir, Vec3& result_value) const {
+    void sample_scatter_from_lens(Random& random, Vec3 lens_dir, Vec3& light_dir, Color& result_value) const {
         random.lambert(normal, light_dir);
         result_value = albedo;
     }
 
-    void sample_scatter_from_light(Random& random, Vec3 light_dir, Vec3& lens_dir, Vec3& result_value) const {
+    void sample_scatter_from_light(Random& random, Vec3 light_dir, Vec3& lens_dir, Color& result_value) const {
         sample_scatter_from_lens(random, light_dir, lens_dir, result_value);
     }
 };
 
-static float geometric(Vec3 na, Vec3 nb, Vec3 d) {
-    float dsqr = dotsqr(d);
-    return - dot(na, d) * dot(nb, d) / (dsqr * dsqr);
+Surface test_material_surface(World const& world, size_t triangle_index) {
+    if (triangle_index != World::invalid_index) {
+        World::Triangle const& tri = world.triangles[triangle_index];
+        World::Surface const& surface = world.surfaces[tri.surface_index];
+        std::string const& mat_name = world.material_names[surface.material_index];
+        Vec3 normal = norm(world.normals[tri.normal_index]);
+        if (surface.flags & World::flag_invisible) {
+            //does_transmit = true;
+            //flux_gain = Vec3{1.0f, 1.0f, 1.0f};
+            //target_zone_id = tri.other_zone_index;
+            return Surface::black(normal);
+            //} else if (surface.flags & World::flag_masked) {
+            //    does_transmit = true;
+            //    flux_gain = Vec3{1.00f, 0.90f, 0.70f};
+            //    transmit_offset = 0.001f;
+        } else {
+            if (false) {
+                int i = triangle_index;
+                float x = (i % 100) / 100.0f;
+                float y = ((i / 100) % 100) / 100.0f;
+                float z = ((i / 10000) % 100) / 100.0f;
+                return Surface::emissive(normal, x, y, z);
+            } else {
+                if (mat_name == "Fire.FireTexture'XFX.xeolighting'") {
+                    return Surface::emissive(normal, 0.35f, 0.40f, 0.45f);
+                } else if (mat_name == "Fire.FireTexture'UTtech1.Misc.donfire'") {
+                    return Surface::emissive(normal, 6.00f, 5.00f, 1.50f);
+                } else if (mat_name == "Engine.Texture'ShaneChurch.Lampon5'") {
+                    return Surface::emissive(normal, 10.00f, 3.00f, 5.00f);
+                    //} else if (mat_name == "Fire.WetTexture'LavaFX.Lava3'") {
+                    //    return Surface::emissive(normal, 1.00f, 0.30f, 0.10f);
+                } else if (mat_name == "Engine.Texture'DecayedS.Ceiling.T-CELING2'") {
+                    return Surface::emissive(normal, 10.00f, 11.00f, 12.00f);
+                } else if (mat_name == "Engine.Texture'Botpack.Ammocount.AmmoCountBar'") {
+                    return Surface::emissive(normal, 1, 1, 1);
+                } else {
+                    //return Surface::diffuse(normal, 0.02f, 0.02f, 0.02f);
+                    if (fabsf(normal.z) <= 0.2f) {
+                        return Surface::diffuse(normal, 0.60f, 0.03f, 0.03f);
+                    } else {
+                        return Surface::diffuse(normal, 0.30f, 0.30f, 0.40f);
+                    }
+                }
+            }
+        }
+    } else {
+        //emit = Vec3{100.00f, 0.00f, 100.00f};
+        return Surface::black(Vec3{0.0f, 0.0f, 1.0f});
+    }
 }
 
 struct MainCamera {
@@ -277,7 +173,7 @@ struct MainCamera {
 
     static MainCamera targeted(World const& world, Vec3 origin, Vec3 target, float ctan) {
         MainCamera camera;
-        camera.zone_id = world.zone_index_at(origin);
+        camera.zone_id = world.zone_id_at(origin);
         camera.origin = origin;
         camera.forward = norm(target - origin);
         Vec3 up{0, 0, 1};
@@ -289,7 +185,7 @@ struct MainCamera {
         return camera;
     }
 
-    float importance_flux_density(Vec3 direction) const {
+    float ray_density(Vec3 direction) const {
         Vec3 dn = norm(direction);
         float cos_at_lens = dot(dn, forward);
         float cos_at_lens_sqr = cos_at_lens * cos_at_lens;
@@ -329,63 +225,51 @@ struct MainCamera {
     }
 };
 
-Surface test_material_surface(World const& world, size_t zone_id, size_t triangle_index) {
-    if (triangle_index != World::invalid_index) {
-        World::Triangle const& tri = world.zone_trees[zone_id].triangles[triangle_index];
-        World::Surface const& surface = world.surfaces[tri.surface_index];
-        std::string const& mat_name = world.material_names[surface.material_index];
-        Vec3 normal = norm(world.normals[tri.normal_index]);
-        if (surface.flags & World::flag_invisible) {
-            //does_transmit = true;
-            //flux_gain = Vec3{1.0f, 1.0f, 1.0f};
-            //target_zone_id = tri.other_zone_index;
-            return Surface::black(normal);
-        //} else if (surface.flags & World::flag_masked) {
-        //    does_transmit = true;
-        //    flux_gain = Vec3{1.00f, 0.90f, 0.70f};
-        //    transmit_offset = 0.001f;
-        } else {
-            if (false) {
-                int i = triangle_index;
-                float x = (i % 100) / 100.0f;
-                float y = ((i / 100) % 100) / 100.0f;
-                float z = ((i / 10000) % 100) / 100.0f;
-                return Surface::emissive(normal, x, y, z);
-            } else {
-                if (mat_name == "Fire.FireTexture'XFX.xeolighting'") {
-                    return Surface::emissive(normal, 0.35f, 0.40f, 0.45f);
-                } else if (mat_name == "Fire.FireTexture'UTtech1.Misc.donfire'") {
-                    return Surface::emissive(normal, 6.00f, 5.00f, 1.50f);
-                } else if (mat_name == "Engine.Texture'ShaneChurch.Lampon5'") {
-                    return Surface::emissive(normal, 10.00f, 3.00f, 5.00f);
-                //} else if (mat_name == "Fire.WetTexture'LavaFX.Lava3'") {
-                //    return Surface::emissive(normal, 1.00f, 0.30f, 0.10f);
-                } else if (mat_name == "Engine.Texture'DecayedS.Ceiling.T-CELING2'") {
-                    return Surface::emissive(normal, 10.00f, 11.00f, 12.00f);
-                } else {
-                    if (fabsf(normal.z) <= 0.2f) {
-                        return Surface::diffuse(normal, 0.60f, 0.03f, 0.03f);
-                    } else {
-                        return Surface::diffuse(normal, 0.30f, 0.30f, 0.40f);
-                    }
+struct LightTriangleDistribution {
+    DiscreteDistribution distribution;
+    std::vector<float> triangle_probability_density;
+
+    LightTriangleDistribution() = default;
+    LightTriangleDistribution(LightTriangleDistribution&&) = default;
+    LightTriangleDistribution& operator=(LightTriangleDistribution&&) = default;
+
+    LightTriangleDistribution(World const& world, std::vector<Surface> const& world_surfaces, MainCamera const& camera) {
+        std::vector<float> lt_weights(world.triangles.size(), 0.0f);
+        triangle_probability_density.resize(world.triangles.size(), 0.0f);
+        bool any_triangle_chosen = false;
+        for (size_t triangle_index = 0; triangle_index < world.triangles.size(); ++triangle_index) {
+            World::Triangle const& tri = world.triangles[triangle_index];
+            if (tri.zone_id == camera.zone_id) {
+                Surface const& surface = world_surfaces[triangle_index];
+                float density = elementwise_foldl1([](float a, float b) { return a + b; }, surface.emission);
+                if (density > 0.0f && tri.area > 0.0f) {
+                    lt_weights[triangle_index] = density * tri.area;
+                    any_triangle_chosen = true;
                 }
             }
         }
-    } else {
-        //emit = Vec3{100.00f, 0.00f, 100.00f};
-        return Surface::black(Vec3{0.0f, 0.0f, 1.0f});
+        if (!any_triangle_chosen) {
+            lt_weights[0] = 1.0f;
+        }
+        distribution = DiscreteDistribution::make(lt_weights);
+        for (size_t triangle_index = 0; triangle_index < world.triangles.size(); ++triangle_index) {
+            World::Triangle const& tri = world.triangles[triangle_index];
+            if (tri.area > 0.0f) {
+                triangle_probability_density[triangle_index] = distribution.probability_of(triangle_index) / tri.area;
+            }
+        }
     }
-}
+};
 
 struct PathNode {
     uint64_t prev_node_index;
-    int node_level;
+    int path_length;
     int path_index;
-    Vec3 incoming_value_density;
+    Color incoming_value_density;
     Vec3 incoming_direction;
     Vec3 position;
-    Surface surface;
-    Vec3 scattered_value_density;
+    size_t triangle_index;
+    Color scattered_value_density;
 };
 
 struct Connector {
@@ -393,7 +277,8 @@ struct Connector {
     uint64_t light_path_node;
     int ix;
     int iy;
-    Vec3 value;
+    Color value;
+    size_t expected_hit_triangle_index;
 };
 
 enum class RayType {
@@ -415,21 +300,53 @@ static void parse_ray_id(uint64_t ray_id, RayType& type, uint8_t& epoch, uint64_
 constexpr uint64_t path_origin_bit = (uint64_t)1 << 63;
 
 struct Epoch {
+    std::shared_mutex mutex;
     Arena<PathNode> path_node_arena;
     Arena<Connector> connector_arena;
-    std::atomic<uint64_t> use_count = 0;
-    std::atomic<int> loader_progress = 0;
-    std::atomic<int> connector_progress = 0;
-    std::atomic<bool> completion_recorded = false;
-    size_t epoch_number = 0;
+    AlignedBuffer light_sample_buffer;
+    std::atomic<uint64_t> use_count;
+    std::atomic<int> phase_one_progress;
+    std::atomic<int> completed_light_paths_count;
+    std::atomic<int> phase_two_progress;
+    std::atomic<size_t> total_resets;
+    std::atomic<size_t> total_phase_one_rays_sent;
+    std::atomic<size_t> total_phase_two_rays_sent;
+    size_t epoch_number;
+    LightTriangleDistribution light_triangles_distribution;
 
-    void reset(size_t new_epoch_number) {
-        path_node_arena.clear();
-        connector_arena.clear();
-        loader_progress.store(0, std::memory_order_relaxed);
-        connector_progress.store(0, std::memory_order_relaxed);
-        completion_recorded.store(false, std::memory_order_relaxed);
-        epoch_number = new_epoch_number;
+    Epoch() {
+        light_sample_buffer = AlignedBuffer(light_samples_per_epoch * sizeof(uint64_t));
+        use_count.store(0, std::memory_order_relaxed);
+        phase_one_progress.store(light_samples_per_epoch, std::memory_order_relaxed);
+        completed_light_paths_count.store(light_samples_per_epoch, std::memory_order_relaxed);
+        phase_two_progress.store(pixels_per_epoch, std::memory_order_relaxed);
+        total_resets.store(0, std::memory_order_relaxed);
+        total_phase_one_rays_sent.store(0, std::memory_order_relaxed);
+        total_phase_two_rays_sent.store(0, std::memory_order_relaxed);
+    }
+
+    uint64_t& light_sample_at(int i) {
+        return ((uint64_t*)light_sample_buffer.data())[i];
+    }
+
+    bool advance_phase_one_progress(int delta, int& iq, int limit) {
+        iq = phase_one_progress.fetch_add(delta, std::memory_order_relaxed);
+        if (iq < limit) {
+            return true;
+        } else {
+            phase_one_progress.store(limit, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    bool advance_phase_two_progress(int delta, int& iq, int limit) {
+        iq = phase_two_progress.fetch_add(delta, std::memory_order_relaxed);
+        if (iq < limit) {
+            return true;
+        } else {
+            phase_two_progress.store(limit, std::memory_order_relaxed);
+            return false;
+        }
     }
 };
 
@@ -453,6 +370,11 @@ public:
         }
     }
 
+    AtomicCounterGuard(std::atomic<T>& counter, std::adopt_lock_t, T delta = 1) {
+        _counter_ptr = &counter;
+        _delta = delta;
+    }
+
     AtomicCounterGuard(AtomicCounterGuard&& other) {
         _counter_ptr = other._counter_ptr;
         _delta = other._delta;
@@ -460,7 +382,7 @@ public:
     }
 
     AtomicCounterGuard& operator=(AtomicCounterGuard&& other) {
-        release();
+        unlock();
         _counter_ptr = other._counter_ptr;
         _delta = other._delta;
         other._delta = 0;
@@ -468,10 +390,10 @@ public:
     }
 
     ~AtomicCounterGuard() {
-        release();
+        unlock();
     }
 
-    void release(std::memory_order decrement_order = std::memory_order_release) {
+    void unlock(std::memory_order decrement_order = std::memory_order_release) {
         if (_delta != 0) {
             _counter_ptr->fetch_sub(_delta, decrement_order);
             _delta = 0;
@@ -484,20 +406,51 @@ public:
 };
 
 struct Context {
-    static constexpr uint8_t epoch_count = 4;
+    static constexpr uint8_t epoch_count = 24;
 
     std::atomic<bool>& pauserequested;
     std::atomic<bool>& steprequested;
     World const& world;
     RayPipeline& pipeline;
     MainCamera const& camera;
-    std::mutex epoch_mutex;
-    uint8_t current_epoch_index = 0;
+    std::vector<Surface> world_surfaces;
     Epoch epochs[epoch_count];
+    std::mutex next_epoch_number_mutex;
+    size_t next_epoch_number;
     std::atomic<size_t> total_frames_completed;
+    std::atomic<uint64_t> current_ray_count;
     std::atomic<uint64_t> ray_counter;
-    std::unique_ptr<std::atomic<uint64_t>[]> accum_buffer;
-    std::atomic<uint64_t> global_denominator_additive;
+    std::unique_ptr<std::atomic<uint64_t>[]> overlay_accum_buffer;
+    std::unique_ptr<std::atomic<uint64_t>[]> additive_accum_buffer;
+    std::atomic<uint64_t> additive_denominator;
+    size_t packet_count_threshold;
+
+    Context(std::atomic<bool>& pauserequested, std::atomic<bool>& steprequested, World const& world, RayPipeline& pipeline, MainCamera const& camera)
+        : pauserequested(pauserequested)
+        , steprequested(steprequested)
+        , world(world)
+        , pipeline(pipeline)
+        , camera(camera)
+    {
+        world_surfaces.resize(world.triangles.size());
+        for (size_t i = 0; i < world_surfaces.size(); ++i) {
+            world_surfaces[i] = test_material_surface(world, i);
+        }
+        total_frames_completed.store(0, std::memory_order_relaxed);
+        current_ray_count.store(0, std::memory_order_relaxed);
+        ray_counter.store(0, std::memory_order_relaxed);
+        next_epoch_number = 0;
+        overlay_accum_buffer = std::make_unique<std::atomic<uint64_t>[]>(width * height * 4);
+        for (size_t i = 0; i < width * height * 4; ++i) {
+            overlay_accum_buffer[i].store(0, std::memory_order_relaxed);
+        }
+        additive_accum_buffer = std::make_unique<std::atomic<uint64_t>[]>(width * height * 3);
+        for (size_t i = 0; i < width * height * 3; ++i) {
+            additive_accum_buffer[i].store(0, std::memory_order_relaxed);
+        }
+        additive_denominator.store(0, std::memory_order_relaxed);
+        packet_count_threshold = 5000;
+    }
 
     bool is_paused() {
         return pauserequested.load(std::memory_order_relaxed) && !steprequested.load(std::memory_order_relaxed);
@@ -507,115 +460,75 @@ struct Context {
         steprequested.store(false, std::memory_order_relaxed);
     }
 
-    std::atomic<uint64_t>* accum_ptr(int ix, int iy) {
-        return accum_buffer.get() + 4 * width * iy + 4 * ix;
+    Surface triangle_surface(size_t triangle_index) {
+        if (triangle_index != World::invalid_index) {
+            return world_surfaces[triangle_index];
+        } else {
+            //emit = Vec3{100.00f, 0.00f, 100.00f};
+            return Surface::black(Vec3{0.0f, 0.0f, 1.0f});
+        }
     }
 
-    Vec3 color_at(int ix, int iy) {
-        std::atomic<uint64_t>* accum_ptr = accum_buffer.get() + 4 * width * iy + 4 * ix;
-        float w = global_denominator_additive.load(std::memory_order_relaxed) + accum_ptr[3].load(std::memory_order_relaxed);
-        Vec3 result{0, 0, 0};
-        if (w != 0) {
-            float scale = (accum_den_scale / accum_num_scale) / w;
-            result.x = scale * (float)accum_ptr[0].load(std::memory_order_relaxed);
-            result.y = scale * (float)accum_ptr[1].load(std::memory_order_relaxed);
-            result.z = scale * (float)accum_ptr[2].load(std::memory_order_relaxed);
+    Color color_at(int ix, int iy) {
+        int pixel_i = iy * width + ix;
+        std::atomic<uint64_t>* overlay_accum_ptr = overlay_accum_buffer.get() + 4 * pixel_i;
+        float ow = overlay_accum_ptr[3].load(std::memory_order_relaxed);
+        Color result{0, 0, 0};
+        if (ow != 0) {
+            float scale = (accum_den_scale / accum_num_scale) / ow;
+            result[0] = scale * (float)overlay_accum_ptr[0].load(std::memory_order_relaxed);
+            result[1] = scale * (float)overlay_accum_ptr[1].load(std::memory_order_relaxed);
+            result[2] = scale * (float)overlay_accum_ptr[2].load(std::memory_order_relaxed);
+        }
+        std::atomic<uint64_t>* additive_accum_ptr = additive_accum_buffer.get() + 3 * pixel_i;
+        float aw = additive_denominator.load(std::memory_order_relaxed);
+        if (aw != 0) {
+            float scale = (accum_den_scale / accum_num_scale) / aw;
+            result[0] += scale * (float)additive_accum_ptr[0].load(std::memory_order_relaxed);
+            result[1] += scale * (float)additive_accum_ptr[1].load(std::memory_order_relaxed);
+            result[2] += scale * (float)additive_accum_ptr[2].load(std::memory_order_relaxed);
         }
         return result;
     }
 
-    void increment_accum_color(int ix, int iy, Vec3 value) {
-        uint64_t vr = value.x * accum_num_scale + 0.5f;
-        uint64_t vg = value.y * accum_num_scale + 0.5f;
-        uint64_t vb = value.z * accum_num_scale + 0.5f;
-        std::atomic<uint64_t>* ptr = accum_ptr(ix, iy);
-        if (vr != 0) ptr[0].fetch_add(vr, std::memory_order_relaxed);
-        if (vg != 0) ptr[1].fetch_add(vg, std::memory_order_relaxed);
-        if (vb != 0) ptr[2].fetch_add(vb, std::memory_order_relaxed);
+    void increment_overlay_accum_color(int ix, int iy, Color value) {
+        uint64_t vr = value[0] * accum_num_scale + 0.5f;
+        uint64_t vg = value[1] * accum_num_scale + 0.5f;
+        uint64_t vb = value[2] * accum_num_scale + 0.5f;
+        std::atomic<uint64_t>* overlay_accum_ptr = overlay_accum_buffer.get() + 4 * width * iy + 4 * ix;
+        if (vr != 0) overlay_accum_ptr[0].fetch_add(vr, std::memory_order_relaxed);
+        if (vg != 0) overlay_accum_ptr[1].fetch_add(vg, std::memory_order_relaxed);
+        if (vb != 0) overlay_accum_ptr[2].fetch_add(vb, std::memory_order_relaxed);
     }
 
-    void increment_accum_weight(int ix, int iy, float weight) {
+    void increment_overlay_accum_weight(int ix, int iy, float weight) {
         uint64_t vw = weight * accum_den_scale + 0.5f;
-        std::atomic<uint64_t>* ptr = accum_ptr(ix, iy);
-        ptr[3].fetch_add(vw, std::memory_order_relaxed);
+        std::atomic<uint64_t>* overlay_accum_ptr = overlay_accum_buffer.get() + 4 * width * iy + 4 * ix;
+        if (vw != 0) overlay_accum_ptr[3].fetch_add(vw, std::memory_order_relaxed);
     }
 
-    void increment_weight_global(float weight) {
+    void increment_additive_accum_color(int ix, int iy, Color value) {
+        uint64_t vr = value[0] * accum_num_scale + 0.5f;
+        uint64_t vg = value[1] * accum_num_scale + 0.5f;
+        uint64_t vb = value[2] * accum_num_scale + 0.5f;
+        std::atomic<uint64_t>* additive_accum_ptr = additive_accum_buffer.get() + 3 * width * iy + 3 * ix;
+        if (vr != 0) additive_accum_ptr[0].fetch_add(vr, std::memory_order_relaxed);
+        if (vg != 0) additive_accum_ptr[1].fetch_add(vg, std::memory_order_relaxed);
+        if (vb != 0) additive_accum_ptr[2].fetch_add(vb, std::memory_order_relaxed);
+    }
+
+    void increment_additive_weight(float weight) {
         uint64_t vw = weight * accum_den_scale + 0.5f;
-        global_denominator_additive.fetch_add(vw, std::memory_order_relaxed);
-    }
-};
-
-struct CurrentEpochView {
-    Context& context;
-    uint8_t current_epoch;
-    AtomicCounterGuard<uint64_t> current_epoch_guard;
-    Arena<PathNode>::Allocator path_node_allocator;
-    Arena<Connector>::Allocator connector_allocator;
-
-    CurrentEpochView(Context& context)
-        : context(context)
-    {
-    }
-
-    explicit operator bool() const {
-        return (bool)current_epoch_guard;
-    }
-
-    void initialize() {
-        if (!current_epoch_guard) {
-            std::lock_guard<std::mutex> guard(context.epoch_mutex);
-            current_epoch = context.current_epoch_index;
-            current_epoch_guard = AtomicCounterGuard<uint64_t>(context.epochs[current_epoch].use_count);
-            path_node_allocator = context.epochs[current_epoch].path_node_arena.allocator();
-            connector_allocator = context.epochs[current_epoch].connector_arena.allocator();
-        }
-    }
-
-    bool advance_loader_progress(bool& work_performed, int& iq, int limit) {
-        while (true) {
-            initialize();
-            iq = context.epochs[current_epoch].loader_progress.fetch_add(1, std::memory_order_relaxed);
-            if (iq < limit) {
-                context.consume_step_request();
-                return true;
-            }
-            context.epochs[current_epoch].loader_progress.store(limit, std::memory_order_relaxed);
-            bool is_final_epoch_of_frame = (context.epochs[current_epoch].epoch_number + 1) % epochs_per_frame == 0;
-            if (!context.epochs[current_epoch].completion_recorded.exchange(true, std::memory_order_relaxed)) {
-                if (is_final_epoch_of_frame) {
-                    context.total_frames_completed.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-            if (is_final_epoch_of_frame && context.is_paused()) {
-                return false;
-            }
-            {
-                std::lock_guard<std::mutex> guard(context.epoch_mutex);
-                current_epoch_guard.release();
-                if (current_epoch == context.current_epoch_index) {
-                    uint8_t next_epoch = (current_epoch + 1) % Context::epoch_count;
-                    if (context.epochs[next_epoch].use_count.load(std::memory_order_acquire) != 0) {
-                        return false;
-                    }
-                    work_performed = true;
-                    context.epochs[next_epoch].reset(context.epochs[current_epoch].epoch_number + 1);
-                    context.current_epoch_index = next_epoch;
-                }
-            }
-        }
-    }
-
-    Epoch* operator->() {
-        return &context.epochs[current_epoch];
+        if (vw != 0) additive_denominator.fetch_add(vw, std::memory_order_relaxed);
     }
 };
 
 struct EpochView {
     Epoch* epoch_ptr;
+    std::shared_lock<std::shared_mutex> epoch_mutex_guard;
+    AtomicCounterGuard<uint64_t> epoch_counter_guard;
     Arena<PathNode>::View path_node_arena_view;
     Arena<Connector>::View connector_arena_view;
-    AtomicCounterGuard<uint64_t> epoch_guard;
     Arena<PathNode>::Allocator path_node_allocator;
     Arena<Connector>::Allocator connector_allocator;
 
@@ -623,21 +536,41 @@ struct EpochView {
         epoch_ptr = nullptr;
     }
 
-    EpochView(Epoch& epoch)
-        : epoch_ptr(&epoch)
-        , path_node_arena_view(epoch.path_node_arena)
-        , connector_arena_view(epoch.connector_arena)
+    EpochView(Epoch& epoch_object)
+        : epoch_ptr(&epoch_object)
+    {
+        initialize();
+    }
+
+    EpochView(Epoch& epoch_object, std::defer_lock_t)
+        : epoch_ptr(&epoch_object)
     {
     }
 
     EpochView(EpochView&& other) = default;
     EpochView& operator=(EpochView&& other) = default;
 
-    void initialize_allocators() {
-        if (!epoch_guard) {
-            epoch_guard = AtomicCounterGuard<uint64_t>(epoch_ptr->use_count);
+    ~EpochView() {
+        unlock();
+    }
+
+    void initialize() {
+        if (!epoch_counter_guard) {
+            epoch_mutex_guard = std::shared_lock<std::shared_mutex>(epoch_ptr->mutex);
+            epoch_counter_guard = AtomicCounterGuard<uint64_t>(epoch_ptr->use_count);
+            path_node_arena_view = epoch_ptr->path_node_arena.view();
+            connector_arena_view = epoch_ptr->connector_arena.view();
             path_node_allocator = epoch_ptr->path_node_arena.allocator();
             connector_allocator = epoch_ptr->connector_arena.allocator();
+        }
+    }
+
+    void unlock() {
+        if (epoch_counter_guard) {
+            path_node_allocator.release();
+            connector_allocator.release();
+            epoch_counter_guard.unlock();
+            epoch_mutex_guard.unlock();
         }
     }
 
@@ -651,13 +584,11 @@ struct EpochView {
 
     template<typename... Ts>
     PathNode& emplace_path_node(uint64_t& index, Ts&&... args) {
-        initialize_allocators();
         return path_node_allocator.emplace(index, std::forward<Ts>(args)...);
     }
 
     template<typename... Ts>
     Connector& emplace_connector(uint64_t& index, Ts&&... args) {
-        initialize_allocators();
         return connector_allocator.emplace(index, std::forward<Ts>(args)...);
     }
 
@@ -666,54 +597,218 @@ struct EpochView {
     }
 };
 
-static PathNode camera_node(MainCamera const& camera, int ix, int iy) {
-    PathNode path_node;
-    path_node.prev_node_index = path_origin_bit | (iy * width + ix);
-    path_node.node_level = 0;
-    path_node.incoming_value_density = Vec3{1.0f, 1.0f, 1.0f};
-    path_node.incoming_direction = camera.forward;
-    path_node.position = camera.origin;
-    path_node.surface = Surface::black(camera.forward);
-}
+namespace {
+    float geometric(Vec3 na, Vec3 nb, Vec3 d) {
+        float dsqr = dotsqr(d);
+        return -dot(na, d) * dot(nb, d) / (dsqr * dsqr);
+    }
 
-static void get_lens_path_origin_pixel(EpochView& epoch_view, PathNode const& base_path_node, int& ix, int& iy) {
-    PathNode const* iter_node_ptr = &base_path_node;
-    while (true) {
-        if (iter_node_ptr->prev_node_index & path_origin_bit) {
-            uint64_t pixel = iter_node_ptr->prev_node_index & ~path_origin_bit;
-            ix = pixel % width;
-            iy = pixel / width;
-            break;
-        } else {
+    PathNode camera_path_node(MainCamera const& camera, int ix, int iy) {
+        PathNode path_node;
+        path_node.prev_node_index = path_origin_bit | (iy * width + ix);
+        path_node.path_length = 1;
+        path_node.incoming_value_density = Color{1.0f, 1.0f, 1.0f};
+        path_node.incoming_direction = camera.forward;
+        path_node.position = camera.origin;
+        path_node.triangle_index = World::invalid_index;
+        return path_node;
+    }
+
+    void get_lens_path_origin_pixel(EpochView& epoch_view, PathNode const& base_path_node, int& ix, int& iy) {
+        PathNode const* iter_node_ptr = &base_path_node;
+        while ((iter_node_ptr->prev_node_index & path_origin_bit) == 0) {
             iter_node_ptr = &epoch_view.path_node_at(iter_node_ptr->prev_node_index);
         }
+        uint64_t pixel = iter_node_ptr->prev_node_index & ~path_origin_bit;
+        ix = pixel % width;
+        iy = pixel / width;
     }
-}
 
-static bool get_connector_params(MainCamera const& camera, EpochView& epoch_view, PathNode const& lens_node, PathNode const& light_node, int& ix, int& iy, Vec3 value) {
-    Vec3 delta = lens_node.position - light_node.position;
-    if (dot(delta, lens_node.surface.normal) < 0 && dot(delta, light_node.surface.normal) > 0) {
-        get_lens_path_origin_pixel(epoch_view, lens_node, ix, iy);
-        Vec3 dn = norm(delta);
-        Vec3 light_flux_density;
-        if (light_node.prev_node_index & path_origin_bit) {
-            light_flux_density = light_node.surface.scatter_flux_density(dn, light_node.incoming_direction);
-        } else {
-            light_flux_density = light_node.surface.emission_flux_density(dn);
-        }
-        Vec3 lens_flux_density;
-        if (lens_node.prev_node_index & path_origin_bit) {
-            float f = camera.importance_flux_density(-dn);
-            lens_flux_density = Vec3{f, f, f};
-        } else {
-            lens_flux_density = lens_node.surface.scatter_flux_density(lens_node.incoming_direction, -dn);
-        }
-        float geom = geometric(lens_node.surface.normal, light_node.surface.normal, delta);
-        assign_elementwise_product(light_flux_density, light_node.incoming_value_density);
-        assign_elementwise_product(lens_flux_density, lens_node.incoming_value_density);
-        value = geom * elementwise_product(lens_flux_density, light_flux_density);
+    bool is_path_enabled(int lens_path_length, int light_path_length) {
         return true;
-    } else {
+        //return lens_path_length + light_path_length == 3;
+    }
+
+    bool is_path_enabled_and_recorded(int lens_path_length, int light_path_length) {
+        return is_path_enabled(lens_path_length, light_path_length) &&
+            (true || lens_path_length == 3 && light_path_length == 0);
+    }
+
+    constexpr int max_lens_path_length = 1000;
+    constexpr int max_light_path_length = 1000;
+
+    float lens_path_alt_weight(Context& context, EpochView& epoch_view, float probability_base, PathNode const& initial_lens_node, int initial_light_path_length, Vec3 initial_direction) {
+        float total_weight = 0.0f;
+        PathNode const* current_node_ptr = &initial_lens_node;
+        Surface current_node_surface = context.triangle_surface(initial_lens_node.triangle_index);
+        int current_light_path_length = initial_light_path_length + 1;
+        Vec3 current_incoming_dir = -initial_direction;
+        float current_probability = probability_base;
+        while (!(current_node_ptr->prev_node_index & path_origin_bit)) {
+            PathNode const& prev_node = epoch_view.path_node_at(current_node_ptr->prev_node_index);
+            Surface prev_node_surface = context.triangle_surface(prev_node.triangle_index);
+            float current_to_prev_geom;
+            float prev_node_full_scatter_prob;
+            if (prev_node.prev_node_index & path_origin_bit) {
+                current_to_prev_geom = geometric(context.camera.forward, current_node_surface.normal, current_node_ptr->position - prev_node.position);
+                prev_node_full_scatter_prob =
+                    ((float)pixels_per_epoch / light_samples_per_epoch) *
+                    connections_per_lens_sample *
+                    context.camera.ray_density(-current_node_ptr->incoming_direction);
+            } else {
+                current_to_prev_geom = geometric(prev_node_surface.normal, current_node_surface.normal, current_node_ptr->position - prev_node.position);
+                prev_node_full_scatter_prob =
+                    prev_node_surface.scatter_event_probability_from_lens(prev_node.path_length, prev_node.incoming_direction) *
+                    prev_node_surface.scatter_probability_density(prev_node.incoming_direction, -current_node_ptr->incoming_direction);
+            }
+            if (is_path_enabled(prev_node.path_length, current_light_path_length)) {
+                if (current_to_prev_geom > 0.0f) {
+                    float to_prev_prob = current_probability / (current_to_prev_geom * prev_node_full_scatter_prob);
+                    total_weight += to_prev_prob * to_prev_prob;
+                }
+            }
+            float current_node_full_scatter_prob;
+            if (current_light_path_length == 1) {
+                current_node_full_scatter_prob =
+                    current_node_surface.emission_probability_density(current_incoming_dir);
+            } else {
+                current_node_full_scatter_prob =
+                    current_node_surface.scatter_event_probability_from_light(current_light_path_length, current_node_ptr->incoming_direction) *
+                    current_node_surface.scatter_probability_density(current_incoming_dir, current_node_ptr->incoming_direction);
+            }
+            current_probability *= current_node_full_scatter_prob / prev_node_full_scatter_prob;
+            current_node_surface = prev_node_surface;
+            current_light_path_length += 1;
+            current_incoming_dir = -current_node_ptr->incoming_direction;
+            current_node_ptr = &prev_node;
+        }
+        return total_weight;
+    }
+
+    float light_path_alt_weight(Context& context, EpochView& epoch_view, float probability_base, int initial_lens_path_length, PathNode const& initial_light_node, Vec3 initial_direction) {
+        float total_weight = 0.0f;
+        PathNode const* current_node_ptr = &initial_light_node;
+        Surface current_node_surface = context.triangle_surface(initial_light_node.triangle_index);
+        int current_lens_path_length = initial_lens_path_length + 1;
+        Vec3 current_incoming_dir = initial_direction;
+        float current_probability = probability_base;
+        while (!(current_node_ptr->prev_node_index & path_origin_bit)) {
+            PathNode const& prev_node = epoch_view.path_node_at(current_node_ptr->prev_node_index);
+            Surface prev_node_surface = context.triangle_surface( prev_node.triangle_index);
+            float current_to_prev_geom = geometric(prev_node_surface.normal, current_node_surface.normal, current_node_ptr->position - prev_node.position);
+            float prev_node_full_scatter_prob;
+            if (prev_node.prev_node_index & path_origin_bit) {
+                prev_node_full_scatter_prob =
+                    prev_node_surface.emission_probability_density(-current_node_ptr->incoming_direction);
+            } else {
+                prev_node_full_scatter_prob =
+                    prev_node_surface.scatter_event_probability_from_lens(prev_node.path_length, prev_node.incoming_direction) *
+                    prev_node_surface.scatter_probability_density(prev_node.incoming_direction, -current_node_ptr->incoming_direction);
+            }
+            if (is_path_enabled(current_lens_path_length, prev_node.path_length)) {
+                if (current_to_prev_geom > 0.0f) {
+                    float to_prev_prob = current_probability / (current_to_prev_geom * prev_node_full_scatter_prob);
+                    total_weight += to_prev_prob * to_prev_prob;
+                }
+            }
+            float current_node_full_scatter_prob =
+                current_node_surface.scatter_event_probability_from_light(current_lens_path_length, current_node_ptr->incoming_direction) *
+                current_node_surface.scatter_probability_density(current_node_ptr->incoming_direction, current_incoming_dir);
+            current_probability *= current_node_full_scatter_prob / prev_node_full_scatter_prob;
+            current_node_surface = prev_node_surface;
+            current_lens_path_length += 1;
+            current_incoming_dir = -current_node_ptr->incoming_direction;
+            current_node_ptr = &prev_node;
+        }
+        if (is_path_enabled(current_lens_path_length, 0)) {
+            size_t origin_light_triangle_index = current_node_ptr->prev_node_index & ~path_origin_bit;
+            float origin_probability_density =
+                connections_per_lens_sample *
+                epoch_view->light_triangles_distribution.triangle_probability_density[origin_light_triangle_index];
+            if (origin_probability_density > 0.0f) {
+                float to_prev_prob = current_probability / origin_probability_density;
+                total_weight += to_prev_prob * to_prev_prob;
+            }
+        }
+        return total_weight;
+    }
+
+    bool get_connector_value(Context& context, EpochView& epoch_view, PathNode const& lens_node, PathNode const& light_node, Vec3& delta, Color& value) {
+        if (is_path_enabled_and_recorded(lens_node.path_length, light_node.path_length)) {
+            Surface lens_node_surface = context.triangle_surface(lens_node.triangle_index);
+            Surface light_node_surface = context.triangle_surface(light_node.triangle_index);
+            delta = lens_node.position - light_node.position;
+            if (dot(delta, lens_node_surface.normal) < 0 && dot(delta, light_node_surface.normal) > 0) {
+                Vec3 dn = norm(delta);
+                Color light_flux_density;
+                if (light_node.prev_node_index & path_origin_bit) {
+                    light_flux_density = light_node_surface.emission_flux_density(dn);
+                } else {
+                    light_flux_density = light_node_surface.scatter_flux_density(dn, light_node.incoming_direction);
+                }
+                Color lens_flux_density = lens_node_surface.scatter_flux_density(lens_node.incoming_direction, -dn);
+                float geom = geometric(lens_node_surface.normal, light_node_surface.normal, delta);
+                light_flux_density *= light_node.incoming_value_density;
+                lens_flux_density *= lens_node.incoming_value_density;
+                float total_weight = 1.0f;
+                float lens_alt_probability_base;
+                if (light_node.prev_node_index & path_origin_bit) {
+                    lens_alt_probability_base =
+                        geom *
+                        light_node_surface.emission_probability_density(dn);
+                } else {
+                    lens_alt_probability_base =
+                        geom *
+                        light_node_surface.scatter_event_probability_from_light(light_node.path_length, light_node.incoming_direction) *
+                        light_node_surface.scatter_probability_density(dn, light_node.incoming_direction);
+                }
+                if (lens_alt_probability_base > 0.0f) {
+                    total_weight += lens_path_alt_weight(context, epoch_view, lens_alt_probability_base, lens_node, light_node.path_length, dn);
+                }
+                float light_alt_probability_base =
+                    geom *
+                    lens_node_surface.scatter_event_probability_from_lens(lens_node.path_length, lens_node.incoming_direction) *
+                    lens_node_surface.scatter_probability_density(lens_node.incoming_direction, -dn);
+                if (light_alt_probability_base > 0.0f) {
+                    total_weight += light_path_alt_weight(context, epoch_view, light_alt_probability_base, lens_node.path_length, light_node, dn);
+                }
+                value = (geom / total_weight) * (lens_flux_density * light_flux_density);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool get_camera_connector_params(Random& random, Context& context, EpochView& epoch_view, PathNode const& light_node, Vec3& delta, int& ix, int& iy, Color& value) {
+        if (is_path_enabled_and_recorded(1, light_node.path_length)) {
+            Surface light_node_surface = context.triangle_surface(light_node.triangle_index);
+            delta = context.camera.origin - light_node.position;
+            if (dot(delta, context.camera.forward) < 0 && dot(delta, light_node_surface.normal) > 0) {
+                if (context.camera.world_to_pixel(random, delta, ix, iy)) {
+                    Vec3 dn = norm(delta);
+                    Color light_flux_density;
+                    if (light_node.prev_node_index & path_origin_bit) {
+                        light_flux_density = light_node_surface.emission_flux_density(dn);
+                    } else {
+                        light_flux_density = light_node_surface.scatter_flux_density(dn, light_node.incoming_direction);
+                    }
+                    float camera_ray_density = context.camera.ray_density(-dn);
+                    float geom = geometric(context.camera.forward, light_node_surface.normal, delta);
+                    light_flux_density *= light_node.incoming_value_density;
+                    float total_weight = 1.0f;
+                    float light_alt_probability_base =
+                        geom *
+                        ((float)pixels_per_epoch / light_samples_per_epoch) *
+                        connections_per_lens_sample *
+                        camera_ray_density;
+                    if (light_alt_probability_base > 0.0f) {
+                        total_weight += light_path_alt_weight(context, epoch_view, light_alt_probability_base, 1, light_node, dn);
+                    }
+                    value = (geom * camera_ray_density / total_weight) * light_flux_density;
+                    return true;
+                }
+            }
+        }
         return false;
     }
 }
@@ -735,450 +830,422 @@ struct HandlerProcessor: Processor {
     virtual bool work_impl() override {
         bool work_performed = false;
         RayPipeline::Inserter inserter = context.pipeline.inserter();
-        EpochView epoch_views[Context::epoch_count];
-        for (size_t epoch = 0; epoch < Context::epoch_count; ++epoch) {
-            epoch_views[epoch] = EpochView(context.epochs[epoch]);
-        }
         while (true) {
             std::unique_ptr<RayPipeline::RayPacket> packet_ptr = context.pipeline.pop_completed_packet();
             if (!packet_ptr) {
                 break;
             }
             work_performed = true;
+            EpochView epoch_views[Context::epoch_count];
+            for (size_t epoch = 0; epoch < Context::epoch_count; ++epoch) {
+                epoch_views[epoch] = EpochView(context.epochs[epoch], std::defer_lock);
+            }
             for (int i = 0; i < packet_ptr->ray_count; ++i) {
                 RayPipeline::RayData ray_data = packet_ptr->extract_ray_data(i);
                 RayType ray_type;
                 uint8_t epoch;
                 uint64_t data_index;
                 parse_ray_id(ray_data.extra_data, ray_type, epoch, data_index);
+                epoch_views[epoch].initialize();
                 switch (ray_type) {
                 case RayType::LensPath:
                 {
+                    bool path_continued = false;
+                    PathNode& prev_path_node = epoch_views[epoch].path_node_at(data_index);
                     if (ray_data.hit_world_triangle_index != World::invalid_index) {
-                        PathNode& prev_path_node = epoch_views[epoch].path_node_at(data_index);
+                        int ix, iy;
+                        get_lens_path_origin_pixel(epoch_views[epoch], prev_path_node, ix, iy);
                         uint64_t next_path_node_index;
                         PathNode& next_path_node = epoch_views[epoch].emplace_path_node(next_path_node_index);
                         next_path_node.prev_node_index = data_index;
-                        next_path_node.node_level = prev_path_node.node_level + 1;
+                        next_path_node.path_length = prev_path_node.path_length + 1;
+                        next_path_node.path_index = prev_path_node.path_index;
                         next_path_node.incoming_value_density = prev_path_node.scattered_value_density;
                         next_path_node.incoming_direction = -norm(ray_data.direction);
                         next_path_node.position = ray_data.origin + ray_data.max_param * ray_data.direction;
-                        next_path_node.surface = test_material_surface(context.world, packet_ptr->zone_id, ray_data.hit_world_triangle_index);
-                        Vec3 direct_emission = next_path_node.surface.emission_flux_density(next_path_node.incoming_direction);
-                        if (direct_emission.x != 0.0f || direct_emission.y != 0.0f || direct_emission.z != 0.0f) {
-                            int ix, iy;
-                            get_lens_path_origin_pixel(epoch_views[epoch], prev_path_node, ix, iy);
-                            context.increment_accum_color(ix, iy, elementwise_product(direct_emission, next_path_node.incoming_value_density));
+                        next_path_node.triangle_index = ray_data.hit_world_triangle_index;
+                        Surface hit_surface = context.triangle_surface(next_path_node.triangle_index);
+                        if (is_path_enabled_and_recorded(next_path_node.path_length, 0)) {
+                            Color direct_emission = hit_surface.emission_flux_density(next_path_node.incoming_direction);
+                            if (direct_emission[0] != 0.0f || direct_emission[1] != 0.0f || direct_emission[2] != 0.0f) {
+                                float total_weight = 1.0f;
+                                if (next_path_node.path_length > 2) {
+                                    float base_probability =
+                                        connections_per_lens_sample *
+                                        epoch_views[epoch]->light_triangles_distribution.triangle_probability_density[next_path_node.triangle_index];
+                                    if (base_probability != 0.0f) {
+                                        total_weight += lens_path_alt_weight(context, epoch_views[epoch], base_probability, next_path_node, 0, next_path_node.incoming_direction);
+                                    }
+                                }
+                                Color value = (1.0f / total_weight) * (direct_emission * next_path_node.incoming_value_density);
+                                context.increment_overlay_accum_color(ix, iy, value);
+                            }
                         }
-                        //bool does_transmit = false;
-                        //Vec3 flux_gain = Vec3{0.0f, 0.0f, 0.0f};
-                        float transmit_offset = 0.0f;
-                        //Vec3 emit = Vec3{0.0f, 0.0f, 0.0f};
+                        for (int conn_i = 0; conn_i < connections_per_lens_sample; ++conn_i) {
+                            uint32_t light_path_index;
+                            random.uniform_below(light_samples_per_epoch, light_path_index);
+                            size_t light_node_index = epoch_views[epoch]->light_sample_at(light_path_index);
+                            while (!(light_node_index & path_origin_bit)) {
+                                PathNode& light_node = epoch_views[epoch].path_node_at(light_node_index);
+                                Vec3 delta;
+                                Color value;
+                                if (get_connector_value(context, epoch_views[epoch], next_path_node, light_node, delta, value)) {
+                                    uint64_t connector_index;
+                                    Connector& conn = epoch_views[epoch].emplace_connector(connector_index);
+                                    conn.lens_path_node = next_path_node_index;
+                                    conn.light_path_node = light_node_index;
+                                    conn.ix = ix;
+                                    conn.iy = iy;
+                                    conn.value = (1.0f / (float)connections_per_lens_sample) * value;
+                                    conn.expected_hit_triangle_index = next_path_node.triangle_index;
+                                    if (epoch_views[epoch]->use_count.fetch_add(1, std::memory_order_acquire) == 0) {
+                                        throw "bad refcount";
+                                    }
+                                    context.current_ray_count.fetch_add(1, std::memory_order_relaxed);
+                                    inserter.schedule(
+                                        packet_ptr->zone_id,
+                                        light_node.position,
+                                        delta,
+                                        make_ray_id(RayType::Connector, epoch, connector_index),
+                                        0.0f, 1.0f);
+                                }
+                                light_node_index = light_node.prev_node_index;
+                            }
+                        }
                         size_t target_zone_id = packet_ptr->zone_id;
-                        Vec3 lens_dir = next_path_node.incoming_direction;
-                        float scatter_event_probability = next_path_node.surface.scatter_event_probability_from_lens(lens_dir);
-                        bool is_scattered;
-                        random.p(scatter_event_probability, is_scattered);
-                        if (is_scattered) {
-                            Vec3 light_dir;
-                            Vec3 scatter_value;
-                            next_path_node.surface.sample_scatter_from_lens(random, lens_dir, light_dir, scatter_value);
-                            next_path_node.scattered_value_density = (1.0f / scatter_event_probability) * elementwise_product(next_path_node.incoming_value_density, scatter_value);
-                            Vec3 new_origin = ray_data.origin + (ray_data.max_param + transmit_offset) * ray_data.direction;
+                        Vec3 in_dir = next_path_node.incoming_direction;
+                        float scatter_event_probability = hit_surface.scatter_event_probability_from_lens(next_path_node.path_length, in_dir);
+                        bool scatter_pass;
+                        random.p(scatter_event_probability, scatter_pass);
+                        if (next_path_node.path_length >= max_lens_path_length) {
+                            scatter_pass = false;
+                        }
+                        if (scatter_pass) {
+                            Vec3 out_dir;
+                            Color scatter_value;
+                            hit_surface.sample_scatter_from_lens(random, in_dir, out_dir, scatter_value);
+                            next_path_node.scattered_value_density = (1.0f / scatter_event_probability) * (next_path_node.incoming_value_density * scatter_value);
+                            Vec3 new_origin = ray_data.origin + (ray_data.max_param + 0.0f) * ray_data.direction;
+                            context.current_ray_count.fetch_add(1, std::memory_order_relaxed);
                             inserter.schedule(
                                 target_zone_id,
                                 new_origin,
-                                light_dir,
+                                out_dir,
                                 make_ray_id(RayType::LensPath, epoch, next_path_node_index));
-                        } else {
-                            epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
+                            path_continued = true;
                         }
-                    } else {
+                    }
+                    if (!path_continued) {
                         epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
                     }
-                    context.ray_counter.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
                 case RayType::LightPath:
                 {
+                    bool path_continued = false;
+                    PathNode& prev_path_node = epoch_views[epoch].path_node_at(data_index);
+                    uint64_t next_path_node_index = World::invalid_index;
                     if (ray_data.hit_world_triangle_index != World::invalid_index) {
-                        PathNode& prev_path_node = epoch_views[epoch].path_node_at(data_index);
-                        uint64_t next_path_node_index;
                         PathNode& next_path_node = epoch_views[epoch].emplace_path_node(next_path_node_index);
                         next_path_node.prev_node_index = data_index;
-                        next_path_node.node_level = prev_path_node.node_level + 1;
+                        next_path_node.path_length = prev_path_node.path_length + 1;
+                        next_path_node.path_index = prev_path_node.path_index;
                         next_path_node.incoming_value_density = prev_path_node.scattered_value_density;
                         next_path_node.incoming_direction = -norm(ray_data.direction);
                         next_path_node.position = ray_data.origin + ray_data.max_param * ray_data.direction;
-                        next_path_node.surface = test_material_surface(context.world, packet_ptr->zone_id, ray_data.hit_world_triangle_index);
+                        next_path_node.triangle_index = ray_data.hit_world_triangle_index;
                         {
-                            Vec3 direction_to_camera = context.camera.origin - next_path_node.position;
-                            if (dot(direction_to_camera, next_path_node.surface.normal) > 0) {
-                                int ix, iy;
-                                if (context.camera.world_to_pixel(random, direction_to_camera, ix, iy)) {
-                                    Vec3 dn = norm(direction_to_camera);
-                                    Vec3 light_flux_density = next_path_node.surface.scatter_flux_density(dn, next_path_node.incoming_direction);
-                                    Vec3 lens_normal = context.camera.forward;
-                                    float lens_flux_density = context.camera.importance_flux_density(-dn);
-                                    float geom = geometric(lens_normal, next_path_node.surface.normal, direction_to_camera);
-                                    assign_elementwise_product(light_flux_density, next_path_node.incoming_value_density);
-                                    Vec3 value = geom * lens_flux_density * light_flux_density;
-                                    uint64_t connector_index;
-                                    Connector& conn = epoch_views[epoch].emplace_connector(connector_index);
-                                    conn.lens_path_node = World::invalid_index;
-                                    conn.light_path_node = next_path_node_index;
-                                    conn.ix = ix;
-                                    conn.iy = iy;
-                                    conn.value = value;
-                                    inserter.schedule(
-                                        packet_ptr->zone_id,
-                                        next_path_node.position,
-                                        direction_to_camera,
-                                        make_ray_id(RayType::Connector, epoch, connector_index),
-                                        0.0f, 1.0f);
-                                    epoch_views[epoch]->use_count.fetch_add(1, std::memory_order_relaxed);
-                                }
+                            int ix, iy;
+                            Vec3 direction_to_camera;
+                            Color value;
+                            if (get_camera_connector_params(random, context, epoch_views[epoch], next_path_node, direction_to_camera, ix, iy, value)) {
+                                uint64_t connector_index;
+                                Connector& conn = epoch_views[epoch].emplace_connector(connector_index);
+                                conn.lens_path_node = World::invalid_index;
+                                conn.light_path_node = next_path_node_index;
+                                conn.ix = ix;
+                                conn.iy = iy;
+                                conn.value = value;
+                                conn.expected_hit_triangle_index = World::invalid_index;
+                                inserter.schedule(
+                                    packet_ptr->zone_id,
+                                    next_path_node.position,
+                                    direction_to_camera,
+                                    make_ray_id(RayType::Connector, epoch, connector_index),
+                                    0.0f, 1.0f);
+                                epoch_views[epoch]->use_count.fetch_add(1, std::memory_order_relaxed);
                             }
                         }
-                        //bool does_transmit = false;
-                        //Vec3 flux_gain = Vec3{0.0f, 0.0f, 0.0f};
-                        float transmit_offset = 0.0f;
-                        //Vec3 emit = Vec3{0.0f, 0.0f, 0.0f};
+                        Surface hit_surface = context.triangle_surface(next_path_node.triangle_index);
                         size_t target_zone_id = packet_ptr->zone_id;
-                        Vec3 light_dir = next_path_node.incoming_direction;
-                        float scatter_event_probability = next_path_node.surface.scatter_event_probability_from_light(light_dir);
-                        bool is_scattered;
-                        random.p(scatter_event_probability, is_scattered);
-                        if (is_scattered) {
-                            Vec3 lens_dir;
-                            Vec3 scatter_value;
-                            next_path_node.surface.sample_scatter_from_light(random, light_dir, lens_dir, scatter_value);
-                            next_path_node.scattered_value_density = (1.0f / scatter_event_probability) * elementwise_product(next_path_node.incoming_value_density, scatter_value);
-                            Vec3 new_origin = ray_data.origin + (ray_data.max_param + transmit_offset) * ray_data.direction;
+                        Vec3 in_dir = next_path_node.incoming_direction;
+                        float scatter_event_probability = hit_surface.scatter_event_probability_from_light(next_path_node.path_length, in_dir);
+                        scatter_event_probability *= 0.1f;
+                        bool scatter_pass;
+                        random.p(scatter_event_probability, scatter_pass);
+                        if (next_path_node.path_length >= max_light_path_length) {
+                            scatter_pass = false;
+                        }
+                        if (scatter_pass) {
+                            Vec3 out_dir;
+                            Color scatter_value;
+                            hit_surface.sample_scatter_from_light(random, in_dir, out_dir, scatter_value);
+                            next_path_node.scattered_value_density = (1.0f / scatter_event_probability) * (next_path_node.incoming_value_density * scatter_value);
+                            Vec3 new_origin = ray_data.origin + (ray_data.max_param + 0.0f) * ray_data.direction;
+                            context.current_ray_count.fetch_add(1, std::memory_order_relaxed);
                             inserter.schedule(
                                 target_zone_id,
                                 new_origin,
-                                lens_dir,
+                                out_dir,
                                 make_ray_id(RayType::LightPath, epoch, next_path_node_index));
-                        } else {
-                            epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
+                            path_continued = true;
                         }
-                    } else {
-                        epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
                     }
-                    context.ray_counter.fetch_add(1, std::memory_order_relaxed);
+                    if (!path_continued) {
+                        epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
+                        uint64_t final_node_index;
+                        if (next_path_node_index != World::invalid_index) {
+                            final_node_index = next_path_node_index;
+                        } else {
+                            final_node_index = data_index;
+                        }
+                        epoch_views[epoch]->light_sample_at(prev_path_node.path_index) = final_node_index;
+                        epoch_views[epoch]->completed_light_paths_count.fetch_add(1, std::memory_order_release);
+                    }
                     break;
                 }
                 case RayType::Connector:
                 {
-                    if (ray_data.max_param == 1.0f) {
-                        Connector& conn = epoch_views[epoch].connector_at(data_index);
-                        size_t lens_path_length = 0;
+                    Connector& conn = epoch_views[epoch].connector_at(data_index);
+                    bool hit_nothing = ray_data.hit_world_triangle_index == World::invalid_index;
+                    bool hit_expected = ray_data.hit_world_triangle_index == conn.expected_hit_triangle_index;
+                    if (hit_nothing || hit_expected) {
+                        size_t lens_path_length = 1;
                         if (conn.lens_path_node != World::invalid_index) {
-                            lens_path_length = epoch_views[epoch].path_node_at(conn.lens_path_node).node_level;
+                            lens_path_length = epoch_views[epoch].path_node_at(conn.lens_path_node).path_length;
                         }
-                        size_t light_path_length = 0;
-                        if (conn.light_path_node != World::invalid_index) {
-                            light_path_length = epoch_views[epoch].path_node_at(conn.light_path_node).node_level;
-                        }
-                        if (lens_path_length == 0 && light_path_length == 1) {
-                            context.increment_accum_color(conn.ix, conn.iy, conn.value);
+                        if (lens_path_length == 1) {
+                            context.increment_additive_accum_color(conn.ix, conn.iy, conn.value);
+                        } else {
+                            context.increment_overlay_accum_color(conn.ix, conn.iy, conn.value);
                         }
                     }
                     epoch_views[epoch]->use_count.fetch_sub(1, std::memory_order_release);
-                    context.ray_counter.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
                 default:
                     throw std::runtime_error("invalid ray type");
                 }
             }
+            context.ray_counter.fetch_add(packet_ptr->ray_count, std::memory_order_relaxed);
+            context.current_ray_count.fetch_sub(packet_ptr->ray_count, std::memory_order_relaxed);
             context.pipeline.collect_ray_packet_spare(std::move(packet_ptr));
         }
         return work_performed;
     }
 };
 
-struct ConnectorProcessor: Processor {
+struct PhaseTwoProcessor: Processor {
     Context& context;
     Random random;
+    int ray_packet_size;
 
-    ConnectorProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
+    PhaseTwoProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
         : Processor(std::move(control_ptr))
         , context(context)
     {
+        ray_packet_size = context.pipeline.get_params().ray_buffer_size;
     }
 
     virtual bool has_pending_work_impl() override {
-        return true;
+        return context.pipeline.get_total_packet_count() < context.packet_count_threshold;
     }
 
     virtual bool work_impl() override {
+        if (context.pipeline.get_total_packet_count() >= context.packet_count_threshold) {
+            return false;
+        }
         bool work_performed = false;
         RayPipeline::Inserter inserter = context.pipeline.inserter();
-        CurrentEpochView current_epoch_view(context);
-        //while (true) {
-        //    if (context.pipeline.get_total_packet_count() >= packet_count_threshold) {
-        //        break;
-        //    }
-        //    if (light_triangles.size() == 0) {
-        //        break;
-        //    }
-        //    int iq;
-        //    if (!current_epoch_view.advance_loader_progress(work_performed, iq, lines_per_epoch)) {
-        //        break;
-        //    }
-        //    work_performed = true;
-        //    int light_i_begin = (iq * light_samples_per_epoch) / lines_per_epoch;
-        //    int light_i_end = ((iq + 1) * light_samples_per_epoch) / lines_per_epoch;
-        //    for (int i = light_i_begin; i < light_i_end; ++i) {
-        //        size_t light_triangle_index;
-        //        light_triangles_distribution.sample(random, light_triangle_index);
-        //        LightTriangle const& lt = light_triangles[light_triangle_index];
-        //        World::Triangle const& wtri = context.world.zone_trees[lt.zone_id].triangles[lt.triangle_index];
-        //        Surface surface = test_material_surface(context.world, lt.zone_id, lt.triangle_index);
-        //        Vec3 a = context.world.vertices[wtri.vertex_indexes[0]];
-        //        Vec3 b = context.world.vertices[wtri.vertex_indexes[1]];
-        //        Vec3 c = context.world.vertices[wtri.vertex_indexes[2]];
-        //        float qa, qb, qc;
-        //        random.uniform(qa);
-        //        random.uniform(qb);
-        //        random.uniform(qc);
-        //        float u = fabsf(qa - qb);
-        //        float v = (1.0f - u) * qc;
-        //        Vec3 light_origin = a + u * (b - a) + v * (c - a);
-        //        uint64_t path_node_index;
-        //        PathNode& path_node = current_epoch_view.path_node_allocator.emplace(path_node_index);
-        //        path_node.prev_node_index = path_origin_bit | (lt.zone_id << 32) | lt.triangle_index;
-        //        path_node.node_level = 0;
-        //        path_node.incoming_value_density = (1.0f / lt.probability_density) * Vec3{1.0f, 1.0f, 1.0f};
-        //        path_node.incoming_direction = surface.normal;
-        //        path_node.position = light_origin;
-        //        path_node.surface = surface;
-        //        {
-        //            Vec3 light_dir;
-        //            Vec3 emit_value;
-        //            surface.sample_emission(random, light_dir, emit_value);
-        //            path_node.scattered_value_density = elementwise_product(path_node.incoming_value_density, emit_value);
-        //            inserter.schedule(
-        //                lt.zone_id,
-        //                light_origin,
-        //                light_dir,
-        //                make_ray_id(RayType::LightPath, current_epoch_view.current_epoch, path_node_index));
-        //            current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
-        //        }
-        //        Vec3 direction_to_camera = context.camera.origin - light_origin;
-        //        if (dot(direction_to_camera, surface.normal) > 0) {
-        //            int ix, iy;
-        //            if (context.camera.world_to_pixel(random, direction_to_camera, ix, iy)) {
-        //                Vec3 dn = norm(direction_to_camera);
-        //                Vec3 light_flux_density = path_node.surface.emission_flux_density(dn);
-        //                Vec3 lens_normal = context.camera.forward;
-        //                float lens_flux_density = context.camera.importance_flux_density(-dn);
-        //                float geom = geometric(lens_normal, path_node.surface.normal, direction_to_camera);
-        //                assign_elementwise_product(light_flux_density, path_node.incoming_value_density);
-        //                Vec3 value = geom * lens_flux_density * light_flux_density;
-        //                uint64_t connector_index;
-        //                Connector& conn = current_epoch_view.connector_allocator.emplace(connector_index);
-        //                conn.lens_path_node = World::invalid_index;
-        //                conn.light_path_node = path_node_index;
-        //                conn.ix = ix;
-        //                conn.iy = iy;
-        //                conn.value = value;
-        //                inserter.schedule(
-        //                    lt.zone_id,
-        //                    light_origin,
-        //                    direction_to_camera,
-        //                    make_ray_id(RayType::Connector, current_epoch_view.current_epoch, connector_index),
-        //                    0.0f, 1.0f);
-        //                current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
-        //            }
-        //        }
-        //        context.increment_weight_global(1.0f / (float)(width * height));
-        //    }
-        //    //int iy = (current_epoch_view->epoch_number % epochs_per_frame) * lines_per_epoch + iq;
-        //    //if (iy < height) {
-        //    //    for (int ix = 0; ix < width; ++ix) {
-        //    //        uint64_t path_node_index;
-        //    //        PathNode& path_node = current_epoch_view.path_node_allocator.emplace(path_node_index);
-        //    //        path_node.prev_node_index = path_origin_bit | (iy * width + ix);
-        //    //        path_node.node_level = 0;
-        //    //        path_node.incoming_value_density = Vec3{1.0f, 1.0f, 1.0f};
-        //    //        path_node.incoming_direction = context.camera.forward;
-        //    //        path_node.position = context.camera.origin;
-        //    //        path_node.surface = Surface::black(context.camera.forward);
-        //    //        Vec3 lens_dir;
-        //    //        context.camera.pixel_to_world(random, ix, iy, lens_dir);
-        //    //        path_node.scattered_value_density = path_node.incoming_value_density;
-        //    //        inserter.schedule(
-        //    //            context.camera.zone_id,
-        //    //            context.camera.origin,
-        //    //            lens_dir,
-        //    //            make_ray_id(RayType::LensPath, current_epoch_view.current_epoch, path_node_index));
-        //    //        current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
-        //    //        context.increment_accum_weight(ix, iy, 1.0f);
-        //    //    }
-        //    //}
-        //}
+        bool any_epoch_processed = true;
+        while (any_epoch_processed) {
+            any_epoch_processed = false;
+            for (size_t epoch = 0; epoch < Context::epoch_count; ++epoch) {
+                EpochView epoch_view(context.epochs[epoch]);
+                if (epoch_view->completed_light_paths_count.load(std::memory_order_acquire) >= light_samples_per_epoch) {
+                    while (true) {
+                        if (context.pipeline.get_total_packet_count() >= context.packet_count_threshold) {
+                            break;
+                        }
+                        int iq;
+                        if (!epoch_view->advance_phase_two_progress(ray_packet_size, iq, pixels_per_epoch)) {
+                            break;
+                        }
+                        work_performed = true;
+                        any_epoch_processed = true;
+                        int pixel_i_begin = iq * epochs_per_frame + (epoch_view->epoch_number % epochs_per_frame);
+                        int pixel_i_end = pixel_i_begin + ray_packet_size * epochs_per_frame;
+                        if (pixel_i_end > width * height) {
+                            pixel_i_end = width * height;
+                        }
+                        for (int pixel_i = pixel_i_begin; pixel_i < pixel_i_end; pixel_i += epochs_per_frame) {
+                            int ix = pixel_i % width;
+                            int iy = pixel_i / width;
+                            uint64_t path_node_index;
+                            PathNode& path_node = epoch_view.emplace_path_node(path_node_index);
+                            path_node = camera_path_node(context.camera, ix, iy);
+                            path_node.path_index = iy * width + ix;
+                            Vec3 lens_dir;
+                            context.camera.pixel_to_world(random, ix, iy, lens_dir);
+                            path_node.scattered_value_density = path_node.incoming_value_density;
+                            if (epoch_view->use_count.fetch_add(1, std::memory_order_acquire) == 0) {
+                                throw "bad refcount";
+                            }
+                            context.current_ray_count.fetch_add(1, std::memory_order_relaxed);
+                            epoch_view->total_phase_two_rays_sent.fetch_add(1, std::memory_order_relaxed);
+                            inserter.schedule(
+                                context.camera.zone_id,
+                                context.camera.origin,
+                                lens_dir,
+                                make_ray_id(RayType::LensPath, epoch, path_node_index));
+                            context.increment_overlay_accum_weight(ix, iy, 1.0f);
+                        }
+                        if (iq >= pixels_per_epoch - ray_packet_size) {
+                            if ((epoch_view->epoch_number + 1) % epochs_per_frame == 0) {
+                                context.total_frames_completed.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            epoch_view->use_count.fetch_sub(1, std::memory_order_release);
+                        }
+                    }
+                }
+            }
+        }
         return work_performed;
     }
 };
 
-struct LoaderProcessor: Processor {
+struct PhaseOneProcessor: Processor {
     Context& context;
     Random random;
-    size_t packet_count_threshold;
+    int ray_packet_size;
 
-    struct LightTriangle {
-        size_t zone_id;
-        size_t triangle_index;
-        float probability_density;
-    };
-
-    DiscreteDistribution light_triangles_distribution;
-    std::vector<LightTriangle> light_triangles;
-
-    LoaderProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
+    PhaseOneProcessor(std::shared_ptr<ProcessorControl> control_ptr, Context& context)
         : Processor(std::move(control_ptr))
         , context(context)
     {
-        packet_count_threshold = 100000 / context.pipeline.get_params().ray_buffer_size;
-        World::Tree const& tree = context.world.zone_trees[context.camera.zone_id];
-        std::vector<float> lt_weights;
-        float total_weight = 0.0f;
-        for (size_t i = 0; i < tree.triangles.size(); ++i) {
-            World::Triangle const& tri = tree.triangles[i];
-            Surface surface = test_material_surface(context.world, context.camera.zone_id, i);
-            float density = surface.emission.x + surface.emission.y + surface.emission.z;
-            if (density > 0.0f) {
-                Vec3 a = context.world.vertices[tri.vertex_indexes[0]];
-                Vec3 b = context.world.vertices[tri.vertex_indexes[1]];
-                Vec3 c = context.world.vertices[tri.vertex_indexes[2]];
-                float area = 0.5f * length(cross(b - a, c - a));
-                if (area > 0.0f) {
-                    float weight = density * area;
-                    light_triangles.push_back(LightTriangle{context.camera.zone_id, i, density});
-                    lt_weights.push_back(weight);
-                    total_weight += weight;
-                }
-            }
-        }
-        light_triangles_distribution = DiscreteDistribution::make(lt_weights);
-        for (LightTriangle& lt : light_triangles) {
-            lt.probability_density /= total_weight;
-        }
+        ray_packet_size = context.pipeline.get_params().ray_buffer_size;
     }
 
     virtual bool has_pending_work_impl() override {
-        return context.pipeline.get_total_packet_count() < packet_count_threshold;
+        return context.pipeline.get_total_packet_count() < context.packet_count_threshold;
     }
 
     virtual bool work_impl() override {
+        if (context.pipeline.get_total_packet_count() >= context.packet_count_threshold) {
+            return false;
+        }
         bool work_performed = false;
         RayPipeline::Inserter inserter = context.pipeline.inserter();
-        CurrentEpochView current_epoch_view(context);
-        while (true) {
-            if (context.pipeline.get_total_packet_count() >= packet_count_threshold) {
-                break;
-            }
-            if (light_triangles.size() == 0) {
-                break;
-            }
-            int iq;
-            if (!current_epoch_view.advance_loader_progress(work_performed, iq, lines_per_epoch)) {
-                break;
-            }
-            work_performed = true;
-            int light_i_begin = (iq * light_samples_per_epoch) / lines_per_epoch;
-            int light_i_end = ((iq + 1) * light_samples_per_epoch) / lines_per_epoch;
-            for (int i = light_i_begin; i < light_i_end; ++i) {
-                size_t light_triangle_index;
-                light_triangles_distribution.sample(random, light_triangle_index);
-                LightTriangle const& lt = light_triangles[light_triangle_index];
-                World::Triangle const& wtri = context.world.zone_trees[lt.zone_id].triangles[lt.triangle_index];
-                Surface surface = test_material_surface(context.world, lt.zone_id, lt.triangle_index);
-                Vec3 a = context.world.vertices[wtri.vertex_indexes[0]];
-                Vec3 b = context.world.vertices[wtri.vertex_indexes[1]];
-                Vec3 c = context.world.vertices[wtri.vertex_indexes[2]];
-                float qa, qb, qc;
-                random.uniform(qa);
-                random.uniform(qb);
-                random.uniform(qc);
-                float u = fabsf(qa - qb);
-                float v = (1.0f - u) * qc;
-                Vec3 light_origin = a + u * (b - a) + v * (c - a);
-                uint64_t path_node_index;
-                PathNode& path_node = current_epoch_view.path_node_allocator.emplace(path_node_index);
-                path_node.prev_node_index = path_origin_bit | (lt.zone_id << 32) | lt.triangle_index;
-                path_node.node_level = 0;
-                path_node.incoming_value_density = (1.0f / lt.probability_density) * Vec3{1.0f, 1.0f, 1.0f};
-                path_node.incoming_direction = surface.normal;
-                path_node.position = light_origin;
-                path_node.surface = surface;
-                {
-                    Vec3 light_dir;
-                    Vec3 emit_value;
-                    surface.sample_emission(random, light_dir, emit_value);
-                    path_node.scattered_value_density = elementwise_product(path_node.incoming_value_density, emit_value);
-                    inserter.schedule(
-                        lt.zone_id,
-                        light_origin,
-                        light_dir,
-                        make_ray_id(RayType::LightPath, current_epoch_view.current_epoch, path_node_index));
-                    current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
-                }
-                Vec3 direction_to_camera = context.camera.origin - light_origin;
-                if (dot(direction_to_camera, surface.normal) > 0) {
-                    int ix, iy;
-                    if (context.camera.world_to_pixel(random, direction_to_camera, ix, iy)) {
-                        Vec3 dn = norm(direction_to_camera);
-                        Vec3 light_flux_density = path_node.surface.emission_flux_density(dn);
-                        Vec3 lens_normal = context.camera.forward;
-                        float lens_flux_density = context.camera.importance_flux_density(-dn);
-                        float geom = geometric(lens_normal, path_node.surface.normal, direction_to_camera);
-                        assign_elementwise_product(light_flux_density, path_node.incoming_value_density);
-                        Vec3 value = geom * lens_flux_density * light_flux_density;
-                        uint64_t connector_index;
-                        Connector& conn = current_epoch_view.connector_allocator.emplace(connector_index);
-                        conn.lens_path_node = World::invalid_index;
-                        conn.light_path_node = path_node_index;
-                        conn.ix = ix;
-                        conn.iy = iy;
-                        conn.value = value;
-                        inserter.schedule(
-                            lt.zone_id,
-                            light_origin,
-                            direction_to_camera,
-                            make_ray_id(RayType::Connector, current_epoch_view.current_epoch, connector_index),
-                            0.0f, 1.0f);
-                        current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
+        bool any_epoch_processed = true;
+        while (any_epoch_processed) {
+            any_epoch_processed = false;
+            for (size_t epoch = 0; epoch < Context::epoch_count; ++epoch) {
+                EpochView epoch_view(context.epochs[epoch], std::defer_lock);
+                if (epoch_view->use_count.load(std::memory_order_relaxed) == 0) {
+                    if (auto epoch_exclusive_guard = std::unique_lock<std::shared_mutex>(epoch_view->mutex, std::try_to_lock)) {
+                        if (epoch_view->use_count.load(std::memory_order_relaxed) == 0) {
+                            size_t new_epoch_number;
+                            {
+                                std::lock_guard<std::mutex> next_epoch_number_guard(context.next_epoch_number_mutex);
+                                if (context.next_epoch_number % epochs_per_frame == 0) {
+                                    if (context.pauserequested.load(std::memory_order_relaxed)) {
+                                        if (!context.steprequested.exchange(false, std::memory_order_relaxed)) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                new_epoch_number = context.next_epoch_number;
+                                context.next_epoch_number += 1;
+                            }
+                            if (epoch_view->phase_one_progress.load(std::memory_order_relaxed) != light_samples_per_epoch) {
+                                throw "bad";
+                            }
+                            if (epoch_view->completed_light_paths_count.load(std::memory_order_relaxed) != light_samples_per_epoch) {
+                                throw "bad";
+                            }
+                            if (epoch_view->phase_two_progress.load(std::memory_order_relaxed) != pixels_per_epoch) {
+                                throw "bad";
+                            }
+                            work_performed = true;
+                            any_epoch_processed = true;
+                            epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
+                            epoch_view->path_node_arena.clear();
+                            epoch_view->connector_arena.clear();
+                            epoch_view->phase_one_progress.store(0, std::memory_order_relaxed);
+                            epoch_view->completed_light_paths_count.store(0, std::memory_order_relaxed);
+                            epoch_view->phase_two_progress.store(0, std::memory_order_relaxed);
+                            epoch_view->total_resets.fetch_add(1, std::memory_order_relaxed);
+                            epoch_view->epoch_number = new_epoch_number;
+                            epoch_view->light_triangles_distribution = LightTriangleDistribution(context.world, context.world_surfaces, context.camera);
+                        }
                     }
                 }
-                context.increment_weight_global(1.0f / (float)(width * height));
+                epoch_view.initialize();
+                while (true) {
+                    int iq;
+                    if (!epoch_view->advance_phase_one_progress(ray_packet_size, iq, light_samples_per_epoch)) {
+                        break;
+                    }
+                    work_performed = true;
+                    any_epoch_processed = true;
+                    int light_i_begin = iq;
+                    int light_i_end = light_i_begin + ray_packet_size;
+                    if (light_i_end > light_samples_per_epoch) {
+                        light_i_end = light_samples_per_epoch;
+                    }
+                    for (int i = light_i_begin; i < light_i_end; ++i) {
+                        size_t light_triangle_index;
+                        epoch_view->light_triangles_distribution.distribution.sample(random, light_triangle_index);
+                        float probability_density = epoch_view->light_triangles_distribution.triangle_probability_density[light_triangle_index];
+                        World::Triangle const& wtri = context.world.triangles[light_triangle_index];
+                        Surface surface = context.triangle_surface(light_triangle_index);
+                        Vec3 a = context.world.vertices[wtri.vertex_indexes[0]];
+                        Vec3 b = context.world.vertices[wtri.vertex_indexes[1]];
+                        Vec3 c = context.world.vertices[wtri.vertex_indexes[2]];
+                        float qa, qb, qc;
+                        random.uniform(qa);
+                        random.uniform(qb);
+                        random.uniform(qc);
+                        float u = fabsf(qa - qb);
+                        float v = (1.0f - u) * qc;
+                        Vec3 light_origin = a + u * (b - a) + v * (c - a);
+                        uint64_t path_node_index;
+                        PathNode& path_node = epoch_view.emplace_path_node(path_node_index);
+                        path_node.prev_node_index = path_origin_bit | light_triangle_index;
+                        path_node.path_length = 1;
+                        path_node.path_index = i;
+                        path_node.incoming_value_density = (1.0f / probability_density) * Color{1.0f, 1.0f, 1.0f};
+                        path_node.incoming_direction = surface.normal;
+                        path_node.position = light_origin;
+                        path_node.triangle_index = light_triangle_index;
+                        Vec3 light_dir;
+                        Color emit_value;
+                        surface.sample_emission(random, light_dir, emit_value);
+                        path_node.scattered_value_density = (path_node.incoming_value_density * emit_value);
+                        if (epoch_view->use_count.fetch_add(1, std::memory_order_acquire) == 0) {
+                            throw "bad refcount";
+                        }
+                        context.current_ray_count.fetch_add(1, std::memory_order_relaxed);
+                        epoch_view->total_phase_one_rays_sent.fetch_add(1, std::memory_order_relaxed);
+                        inserter.schedule(
+                            wtri.zone_id,
+                            light_origin,
+                            light_dir,
+                            make_ray_id(RayType::LightPath, epoch, path_node_index));
+                    }
+                    context.increment_additive_weight((float)(light_i_end - light_i_begin) / (float)(width * height));
+                }
             }
-            //int iy = (current_epoch_view->epoch_number % epochs_per_frame) * lines_per_epoch + iq;
-            //if (iy < height) {
-            //    for (int ix = 0; ix < width; ++ix) {
-            //        uint64_t path_node_index;
-            //        PathNode& path_node = current_epoch_view.path_node_allocator.emplace(path_node_index);
-            //        path_node.prev_node_index = path_origin_bit | (iy * width + ix);
-            //        path_node.node_level = 0;
-            //        path_node.incoming_value_density = Vec3{1.0f, 1.0f, 1.0f};
-            //        path_node.incoming_direction = context.camera.forward;
-            //        path_node.position = context.camera.origin;
-            //        path_node.surface = Surface::black(context.camera.forward);
-            //        Vec3 lens_dir;
-            //        context.camera.pixel_to_world(random, ix, iy, lens_dir);
-            //        path_node.scattered_value_density = path_node.incoming_value_density;
-            //        inserter.schedule(
-            //            context.camera.zone_id,
-            //            context.camera.origin,
-            //            lens_dir,
-            //            make_ray_id(RayType::LensPath, current_epoch_view.current_epoch, path_node_index));
-            //        current_epoch_view->use_count.fetch_add(1, std::memory_order_relaxed);
-            //        context.increment_accum_weight(ix, iy, 1.0f);
-            //    }
-            //}
         }
         return work_performed;
     }
@@ -1194,25 +1261,23 @@ void RendererThread::ThreadFunc()
         //params.triangle_rep = RayPipelineParams::TriangleRep::BoxCenteredUV;
         params.max_chunk_height = 8;
         params.ray_buffer_size = 0x100;
+        //World world = load_world("C:\\dev\\csg\\maps\\LightTest\\map.bvh");
         World world = load_world("Data\\map.bvh");
         //World world = load_test_world();
         RayPipeline pipeline(world, params);
         //Random random;
-
+        
+        //MainCamera camera = MainCamera::targeted(world, Vec3{-24, 115, -65}, Vec3{-24, -3, -92}, 1.0f);
+        //MainCamera camera = MainCamera::targeted(world, Vec3{-24, 115, -65}, Vec3{128, -128, 128}, 0.002f);
         MainCamera camera = MainCamera::targeted(world, Vec3{110, -738, 63}, Vec3{-653, -1641, 18}, 1.0f);
+        //MainCamera camera = MainCamera::targeted(world, Vec3{160, -1438, 103}, Vec3{-653, -1641, -128}, 1.0f);
         //MainCamera camera = MainCamera::targeted(world, Vec3{108, -1150, 55}, Vec3{64, -1150, 236}, 0.1f);
 
-        Context context{pauserequested, steprequested, world, pipeline, camera};
-        context.ray_counter.store(0, std::memory_order_relaxed);
-        context.accum_buffer = std::make_unique<std::atomic<uint64_t>[]>(width * height * 4);
-        for (size_t i = 0; i < width * height * 4; ++i) {
-            context.accum_buffer[i].store(0, std::memory_order_relaxed);
-        }
-        context.global_denominator_additive.store(0, std::memory_order_relaxed);
+        Context context(pauserequested, steprequested, world, pipeline, camera);
 
         std::shared_ptr<ProcessorControl> this_control_ptr = std::make_shared<ProcessorControl>();
-        Scheduler::register_processor(std::make_shared<LoaderProcessor>(this_control_ptr, context));
-        //Scheduler::register_processor(std::make_shared<ConnectorProcessor>(this_control_ptr, context));
+        Scheduler::register_processor(std::make_shared<PhaseOneProcessor>(this_control_ptr, context));
+        Scheduler::register_processor(std::make_shared<PhaseTwoProcessor>(this_control_ptr, context));
         Scheduler::register_processor(std::make_shared<HandlerProcessor>(this_control_ptr, context));
 
         uint64_t start_time = GetTickCount64() + 15000;
@@ -1222,39 +1287,36 @@ void RendererThread::ThreadFunc()
 
             std::this_thread::sleep_for(100ms);
 
+            double total_power = 0;
+
             {
                 auto& bits = bitbuf.Back();
                 bits.resize(width * height * 4);
                 uint8_t* pixels = bits.data();
-                uint64_t global_den = context.global_denominator_additive.load(std::memory_order_relaxed);
                 for (int iy = 0; iy < height; ++iy) {
                     uint8_t* line = pixels + iy * width * 4;
                     for (int ix = 0; ix < width; ++ix) {
                         uint8_t* pixel = line + ix * 4;
-                        std::atomic<uint64_t>* accum_ptr = context.accum_buffer.get() + 4 * width * iy + 4 * ix;
-                        float w = global_den + accum_ptr[3].load(std::memory_order_relaxed);
-                        float r = 0, g = 0, b = 0;
-                        if (w != 0) {
-                            float scale = (accum_den_scale / accum_num_scale) / w;
-                            r = scale * (float)accum_ptr[0].load(std::memory_order_relaxed);
-                            g = scale * (float)accum_ptr[1].load(std::memory_order_relaxed);
-                            b = scale * (float)accum_ptr[2].load(std::memory_order_relaxed);
-                        }
-                        tonemap(r, g, b, pixel);
+                        Color color = context.color_at(ix, iy);
+                        tonemap(color, pixel);
+                        total_power += color[0] + color[1] + color[2];
                     }
                 }
                 bitbuf.Publish();
                 InvalidateRgn(hwnd, nullptr, false);
             }
 
+            total_power /= width * height;
+
             char buf[1024];
             if (pauserequested.load(std::memory_order_relaxed)) {
                 start_time = GetTickCount64() + 15000;
                 snprintf(
                     buf, sizeof(buf),
-                    "rt | %llu frames | packets: %llu | flushing",
+                    "rt | %llu frames | packets: %.4llu | power: %.8e | flushing",
                     context.total_frames_completed.load(std::memory_order_relaxed),
-                    pipeline.get_total_packet_count());
+                    pipeline.get_total_packet_count(),
+                    total_power);
             } else {
                 uint64_t counter = context.ray_counter.load(std::memory_order_relaxed);
                 uint64_t time = GetTickCount64();
@@ -1262,16 +1324,18 @@ void RendererThread::ThreadFunc()
                     context.ray_counter.store(0, std::memory_order_relaxed);
                     snprintf(
                         buf, sizeof(buf),
-                        "rt | %llu frames | packets: %llu | warming up (%llus)",
+                        "rt | %llu frames | packets: %.4llu | power: %.8e | warming up (%llus)",
                         context.total_frames_completed.load(std::memory_order_relaxed),
                         pipeline.get_total_packet_count(),
+                        total_power,
                         (start_time - time) / 1000);
                 } else {
                     snprintf(
                         buf, sizeof(buf),
-                        "rt | %llu frames | packets: %llu | Krays per second: %llu",
+                        "rt | %llu frames | packets: %.4llu | power: %.8e | Krays per second: %llu",
                         context.total_frames_completed.load(std::memory_order_relaxed),
                         pipeline.get_total_packet_count(),
+                        total_power,
                         counter / (time - start_time + 1));
                 }
             }
@@ -1353,3 +1417,5 @@ void RendererThread::Step()
 {
     steprequested.store(true, std::memory_order_relaxed);
 }
+
+//#pragma optimize( "", on )

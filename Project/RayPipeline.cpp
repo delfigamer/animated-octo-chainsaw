@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <immintrin.h>
-        
+
 struct AlignedBufferLayout {
     struct Item {
         void const* source_ptr;
@@ -415,7 +415,7 @@ struct RayPipeline::Internal::Loader {
             for (size_t i = 0; i < triangle_count; ++i) {
                 convert_triangle(
                     world_tree.node_boxes[0][index_begin + i],
-                    world_tree.triangles[index_begin + i],
+                    loader.world.triangles[world_tree.triangle_index_offset + index_begin + i],
                     triangle_boxes[i + 1],
                     *(PackedTriangle*)(packed_triangles_data.data() + triangle_size * (i + 1)));
             }
@@ -477,17 +477,17 @@ struct RayPipeline::Internal::Loader {
             chunk_ptr->vertex_count = (int)packed_vertices.size();
             chunk_ptr->triangle_count = (int)triangle_count;
             chunk_ptr->sentinel_node_index = (int)(packed_nodes.size() - 1);
-            chunk_ptr->triangle_index_offset = triangle_index_offset;
-            
+            chunk_ptr->triangle_index_offset = world_tree.triangle_index_offset + triangle_index_offset;
+
             AlignedBufferLayout buffer_layout;
             buffer_layout.add_item_vector(packed_vertices, chunk_ptr->vertices);
             buffer_layout.add_item(packed_triangles_data.data(), (void**)&chunk_ptr->triangles, triangle_count + 1, triangle_size, loader.pipeline.params.alignof_packed_triangle());
             buffer_layout.add_item_vector(packed_nodes, chunk_ptr->nodes);
-            
+
             chunk_ptr->buffer = AlignedBuffer(buffer_layout.total_size());
-            
+
             buffer_layout.transfer_data(chunk_ptr->buffer.data());
-            
+
             return chunk_ptr;
         }
     };
@@ -507,7 +507,7 @@ struct RayPipeline::Internal::Loader {
         std::vector<TempNode> children;
         std::unique_ptr<Chunk> chunk_ptr;
     };
-    
+
     TempNode create_temp_node(World::Tree const& world_tree, size_t node_level, size_t node_index) {
         TempNode tnode;
         convert_box_from_world(world_tree.node_boxes[node_level][node_index], tnode.box);
@@ -526,7 +526,7 @@ struct RayPipeline::Internal::Loader {
         }
         return tnode;
     }
-    
+
     void enumerate_temp_node_internal(TempNode& tnode, std::vector<size_t>& level_counters) {
         tnode.internal_index = level_counters[tnode.level];
         if (tnode.level >= 1) {
@@ -539,7 +539,7 @@ struct RayPipeline::Internal::Loader {
             enumerate_temp_node_internal(child, level_counters);
         }
     }
-    
+
     void pack_temp_node(Tree& ptree, TempNode& tnode, std::vector<size_t> const& level_offsets) {
         size_t global_index = tnode.internal_index + level_offsets[tnode.level];
         ptree.node_boxes[global_index] = tnode.box;
@@ -555,7 +555,7 @@ struct RayPipeline::Internal::Loader {
             }
         }
     }
-    
+
     std::unique_ptr<Tree> convert_temp_nodes_to_packed_tree(TempNode& root_tnode, std::vector<size_t>& level_counters) {
         std::unique_ptr<Tree> ptree_ptr = std::make_unique<Tree>();
         size_t total_chunk_count = level_counters[0];
@@ -724,6 +724,96 @@ struct RayPipeline::Internal::Utils {
             throw std::runtime_error("invalid box representation value");
         }
     }
+
+    struct Round {
+        static constexpr float p = 1.0f + 0x1p-23f;
+        static constexpr float m = 1.0f - 0x1p-23f;
+
+        static float up(float a) {
+            return a > 0.0f ? a * p : a * m;
+        }
+
+        static float dn(float a) {
+            return a > 0.0f ? a * m : a * p;
+        }
+
+        static float Up(float a) {
+            return a * p;
+        }
+
+        static float Dn(float a) {
+            return a * m;
+        }
+
+        static Vec3 Upv(Vec3 a) {
+            return elementwise_map(Up, a);
+        }
+
+        static Vec3 Dnv(Vec3 a) {
+            return elementwise_map(Dn, a);
+        }
+    };
+
+    static void make_ray_space_for(
+        Vec3 origin, Vec3 dir,
+        Vec3 box_min, Vec3 box_max,
+        int& permutation,
+        Vec3& shear,
+        Vec3& origin_near, Vec3& origin_far,
+        Vec3& dir_inverse_near, Vec3& dir_inverse_far,
+        Vec3& invert_box_mask
+    ) {
+        int max_dim = 0;
+        if (fabsf(dir[1]) > fabsf(dir[0])) {
+            max_dim = 1;
+        }
+        if (fabsf(dir[2]) > fabsf(dir[max_dim])) {
+            max_dim = 2;
+        }
+        int kz = max_dim;
+        int kx = (kz + 1) % 3;
+        int ky = (kx + 1) % 3;
+        if (dir[kz] < 0) {
+            std::swap(kx, ky);
+        }
+        permutation = (int32_t)(((uint32_t)kx << 30) | ((uint32_t)ky << 28) | ((uint32_t)kz << 26));
+        shear.x = dir[kx] / dir[kz];
+        shear.y = dir[ky] / dir[kz];
+        shear.z = 1.0f / dir[kz];
+
+        int near_kx = kx, far_kx = 3 + kx;
+        int near_ky = ky, far_ky = 3 + ky;
+        int near_kz = kz, far_kz = 3 + kz;
+        if (dir[kx] < 0) std::swap(near_kx, far_kx);
+        if (dir[ky] < 0) std::swap(near_ky, far_ky);
+        if (dir[kz] < 0) std::swap(near_kz, far_kz);
+        float const eps = 5.0f * 0x1p-24f;
+        Vec3 lower = Round::Dnv(elementwise_map(fabsf, origin - box_min));
+        Vec3 upper = Round::Upv(elementwise_map(fabsf, origin - box_max));
+        float max_z = fmaxf(lower[kz], upper[kz]);
+        origin_near[kx] = Round::up(origin[kx] + Round::Up(eps * Round::Up(lower[kx] + max_z)));
+        origin_near[ky] = Round::up(origin[ky] + Round::Up(eps * Round::Up(lower[ky] + max_z)));
+        origin_near[kz] = origin[kz];
+        origin_far[kx] = Round::dn(origin[kx] - Round::Up(eps * Round::Up(upper[kx] + max_z)));
+        origin_far[ky] = Round::dn(origin[ky] - Round::Up(eps * Round::Up(upper[ky] + max_z)));
+        origin_far[kz] = origin[kz];
+        if (dir[kx] < 0) {
+            std::swap(origin_near[kx], origin_far[kx]);
+        }
+        if (dir[ky] < 0) {
+            std::swap(origin_near[ky], origin_far[ky]);
+        }
+        dir_inverse_near = Round::Dnv(Round::Dnv(elementwise_inverse(dir)));
+        dir_inverse_far = Round::Upv(Round::Upv(elementwise_inverse(dir)));
+        union {
+            float allbits_float;
+            int32_t allbits_int;
+        };
+        allbits_int = -1;
+        invert_box_mask[kx] = dir[kx] < 0 ? allbits_float : 0;
+        invert_box_mask[ky] = dir[ky] < 0 ? allbits_float : 0;
+        invert_box_mask[kz] = dir[kz] < 0 ? allbits_float : 0;
+    }
 };
 
 //struct RayPipeline::Internal::ChunkIntersectorImmediate {
@@ -738,7 +828,7 @@ struct RayPipeline::Internal::Utils {
 //    std::vector<int> pnode_stack;
 //    int hit_triangle_index = 0;
 //    Vec3 hit_triangle_pos;
-//    
+//
 //    void intersect_triangle_triple_point_common(PackedNode const& pnode, Vec3 a, Vec3 b, Vec3 c, int triangle_index) {
 //        a = a - ray_origin;
 //        b = b - ray_origin;
@@ -772,7 +862,7 @@ struct RayPipeline::Internal::Utils {
 //            hit_triangle_pos = Vec3{(float)(u / det), (float)(v / det), (float)(w / det)};
 //        }
 //    }
-//    
+//
 //    void intersect_triangle_box_centered_common(PackedNode const& pnode, Vec3 du, Vec3 dv, Vec3 dn, int triangle_index) {
 //        float direction_n = dot(ray_direction, dn);
 //        if (direction_n <= 0) {
@@ -794,7 +884,7 @@ struct RayPipeline::Internal::Utils {
 //            }
 //        }
 //    }
-//    
+//
 //    void intersect_triangle(PackedNode const& pnode, int index) {
 //        switch (params.triangle_rep) {
 //        case RayPipelineParams::TriangleRep::TriplePointIndexed:
@@ -896,43 +986,71 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         friend YmmFloat det3(YmmVec3 a, YmmVec3 b, YmmVec3 c) {
             return dot(cross(a, b), c);
         }
+
+        friend YmmVec3 elementwise_inverse(YmmVec3 a) {
+            return YmmVec3{a.x.recip(), a.y.recip(), a.z.recip()};
+        }
+
+        static YmmVec3 from_data(YmmFloatData const* d) {
+            return YmmVec3{YmmFloat(d[0]), YmmFloat(d[1]), YmmFloat(d[2])};
+        }
     };
 
-    struct YmmSpaceShear {
+    struct YmmRaySpace {
         YmmInt permutation;
         YmmFloat sx, sy, sz;
+        YmmVec3 origin_near, origin_far;
+        YmmVec3 dir_inverse_near, dir_inverse_far;
+        YmmVec3 invert_box_mask;
 
-        static YmmSpaceShear make_for(YmmVec3 dir) {
+        static YmmRaySpace make_for(YmmVec3 origin, YmmVec3 dir, Vec3 box_min, Vec3 box_max) {
+            YmmFloatData ox_data = origin.x.data();
+            YmmFloatData oy_data = origin.y.data();
+            YmmFloatData oz_data = origin.z.data();
             YmmFloatData dx_data = dir.x.data();
             YmmFloatData dy_data = dir.y.data();
             YmmFloatData dz_data = dir.z.data();
             YmmIntData permutation_data;
             YmmFloatData sx_data, sy_data, sz_data;
+            YmmFloatData origin_near_data[3];
+            YmmFloatData origin_far_data[3];
+            YmmFloatData dir_inverse_near_data[3];
+            YmmFloatData dir_inverse_far_data[3];
+            YmmFloatData invert_box_mask_data[3];
             for (int i = 0; i < 8; ++i) {
-                float d[3] = {dx_data.x[i], dy_data.x[i], dz_data.x[i]};
-                int max_dim = 0;
-                if (fabsf(d[1]) > fabsf(d[0])) {
-                    max_dim = 1;
-                }
-                if (fabsf(d[2]) > fabsf(d[max_dim])) {
-                    max_dim = 2;
-                }
-                int kz = max_dim;
-                int kx = (kz + 1) % 3;
-                int ky = (kx + 1) % 3;
-                if (d[kz] < 0) {
-                    std::swap(kx, ky);
-                }
-                permutation_data.x[i] = (int32_t)(((uint32_t)kx << 30) | ((uint32_t)ky << 28) | ((uint32_t)kz << 26));
-                sx_data.x[i] = d[kx] / d[kz];
-                sy_data.x[i] = d[ky] / d[kz];
-                sz_data.x[i] = 1.0f / d[kz];
+                Vec3 this_origin = {ox_data.x[i], oy_data.x[i], oz_data.x[i]};
+                Vec3 this_dir = {dx_data.x[i], dy_data.x[i], dz_data.x[i]};
+                int permutation;
+                Vec3 shear, origin_near, origin_far, dir_inverse_near, dir_inverse_far, invert_box_mask;
+                Utils::make_ray_space_for(
+                    this_origin, this_dir,
+                    box_min, box_max,
+                    permutation,
+                    shear,
+                    origin_near, origin_far,
+                    dir_inverse_near, dir_inverse_far,
+                    invert_box_mask
+                );
+                permutation_data.x[i] = permutation;
+                sx_data.x[i] = shear.x;
+                sy_data.x[i] = shear.y;
+                sz_data.x[i] = shear.z;
+                for (int k = 0; k < 3; ++k) origin_near_data[k].x[i] = origin_near[k];
+                for (int k = 0; k < 3; ++k) origin_far_data[k].x[i] = origin_far[k];
+                for (int k = 0; k < 3; ++k) dir_inverse_near_data[k].x[i] = dir_inverse_near[k];
+                for (int k = 0; k < 3; ++k) dir_inverse_far_data[k].x[i] = dir_inverse_far[k];
+                for (int k = 0; k < 3; ++k) invert_box_mask_data[k].x[i] = invert_box_mask[k];
             }
-            YmmSpaceShear ss;
+            YmmRaySpace ss;
             ss.permutation = YmmInt(permutation_data);
             ss.sx = YmmFloat(sx_data);
             ss.sy = YmmFloat(sy_data);
             ss.sz = YmmFloat(sz_data);
+            ss.origin_near = YmmVec3::from_data(origin_near_data);
+            ss.origin_far = YmmVec3::from_data(origin_far_data);
+            ss.dir_inverse_near = YmmVec3::from_data(dir_inverse_near_data);
+            ss.dir_inverse_far = YmmVec3::from_data(dir_inverse_far_data);
+            ss.invert_box_mask = YmmVec3::from_data(invert_box_mask_data);
             return ss;
         }
 
@@ -952,7 +1070,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
     YmmFloat min_param;
     YmmFloat max_param;
     YmmInt hit_triangle_index;
-    YmmSpaceShear ray_space_shear;
+    YmmRaySpace ray_space;
 
     static void get_coord_param_interval_minmax(YmmFloat ray_origin, YmmFloat ray_dir_inverse, YmmFloat box_min, YmmFloat box_max, YmmFloat& minp, YmmFloat& maxp) {
         YmmFloat p1 = (box_min - ray_origin) * ray_dir_inverse;
@@ -960,21 +1078,52 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         minp = YmmFloat::min(p1, p2);
         maxp = YmmFloat::max(p1, p2);
     }
-    
+
     static void get_coord_param_interval_center_extent(YmmFloat ray_origin, YmmFloat ray_dir_inverse, YmmFloat box_center, YmmFloat box_extent, YmmFloat& minp, YmmFloat& maxp) {
         YmmFloat pc = (box_center - ray_origin) * ray_dir_inverse;
         YmmFloat pd = (box_extent * ray_dir_inverse).abs();
         minp = pc - pd;
         maxp = pc + pd;
     }
-    
+
+    static void get_coord_param_interval_conservative(
+        YmmFloat origin_near, YmmFloat origin_far,
+        YmmFloat invdir_near, YmmFloat invdir_far,
+        YmmFloat invert_box_mask,
+        YmmFloat box_min, YmmFloat box_max,
+        YmmFloat& minp, YmmFloat& maxp
+    ) {
+        YmmFloat minp1, maxp1, minp2, maxp2;
+        get_coord_param_interval_minmax(origin_near, invdir_near, box_min, box_max, minp1, maxp1);
+        get_coord_param_interval_minmax(origin_far, invdir_far, box_min, box_max, minp2, maxp2);
+        YmmFloat box_near = YmmFloat::blend(box_min, box_max, invert_box_mask);
+        YmmFloat box_far = YmmFloat::blend(box_max, box_min, invert_box_mask);
+        minp = (box_near - origin_near) * invdir_near;
+        maxp = (box_far - origin_far) * invdir_far;
+    }
+
     void clip_param_interval(YmmBox box, YmmFloat& minp, YmmFloat& maxp) {
         YmmFloat minpx, maxpx, minpy, maxpy, minpz, maxpz;
         switch (pipeline.params.box_rep) {
         case RayPipelineParams::BoxRep::MinMax:
-            get_coord_param_interval_minmax(origin.x, dir_inverse.x, box.v[0], box.v[3], minpx, maxpx);
-            get_coord_param_interval_minmax(origin.y, dir_inverse.y, box.v[1], box.v[4], minpy, maxpy);
-            get_coord_param_interval_minmax(origin.z, dir_inverse.z, box.v[2], box.v[5], minpz, maxpz);
+            //get_coord_param_interval_minmax(origin.x, dir_inverse.x, box.v[0], box.v[3], minpx, maxpx);
+            //get_coord_param_interval_minmax(origin.y, dir_inverse.y, box.v[1], box.v[4], minpy, maxpy);
+            //get_coord_param_interval_minmax(origin.z, dir_inverse.z, box.v[2], box.v[5], minpz, maxpz);
+            get_coord_param_interval_conservative(
+                ray_space.origin_near.x, ray_space.origin_far.x,
+                ray_space.dir_inverse_near.x, ray_space.dir_inverse_far.x,
+                ray_space.invert_box_mask.x,
+                box.v[0], box.v[3], minpx, maxpx);
+            get_coord_param_interval_conservative(
+                ray_space.origin_near.y, ray_space.origin_far.y,
+                ray_space.dir_inverse_near.y, ray_space.dir_inverse_far.y,
+                ray_space.invert_box_mask.y,
+                box.v[1], box.v[4], minpy, maxpy);
+            get_coord_param_interval_conservative(
+                ray_space.origin_near.z, ray_space.origin_far.z,
+                ray_space.dir_inverse_near.z, ray_space.dir_inverse_far.z,
+                ray_space.invert_box_mask.z,
+                box.v[2], box.v[5], minpz, maxpz);
             break;
         case RayPipelineParams::BoxRep::CenterExtent:
             get_coord_param_interval_center_extent(origin.x, dir_inverse.x, box.v[0], box.v[3], minpx, maxpx);
@@ -989,21 +1138,21 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         maxp = YmmFloat::min(maxp, maxpy);
         maxp = YmmFloat::min(maxp, maxpz);
     }
-    
+
     void process_triangle_triple_point_common(YmmInt is_triangle_int, YmmInt triangle_index, YmmVec3 wa, YmmVec3 wb, YmmVec3 wc) {
         YmmFloat is_triangle = YmmFloat(is_triangle_int);
         YmmVec3 a = wa - origin;
         YmmVec3 b = wb - origin;
         YmmVec3 c = wc - origin;
-        YmmVec3 ap = ray_space_shear.apply_permutation(a);
-        YmmVec3 bp = ray_space_shear.apply_permutation(b);
-        YmmVec3 cp = ray_space_shear.apply_permutation(c);
-        YmmFloat apx = ap.x - ray_space_shear.sx * ap.z;
-        YmmFloat apy = ap.y - ray_space_shear.sy * ap.z;
-        YmmFloat bpx = bp.x - ray_space_shear.sx * bp.z;
-        YmmFloat bpy = bp.y - ray_space_shear.sy * bp.z;
-        YmmFloat cpx = cp.x - ray_space_shear.sx * cp.z;
-        YmmFloat cpy = cp.y - ray_space_shear.sy * cp.z;
+        YmmVec3 ap = ray_space.apply_permutation(a);
+        YmmVec3 bp = ray_space.apply_permutation(b);
+        YmmVec3 cp = ray_space.apply_permutation(c);
+        YmmFloat apx = ap.x - ray_space.sx * ap.z;
+        YmmFloat apy = ap.y - ray_space.sy * ap.z;
+        YmmFloat bpx = bp.x - ray_space.sx * bp.z;
+        YmmFloat bpy = bp.y - ray_space.sy * bp.z;
+        YmmFloat cpx = cp.x - ray_space.sx * cp.z;
+        YmmFloat cpy = cp.y - ray_space.sy * cp.z;
         YmmFloat u = cpx * bpy - cpy * bpx;
         YmmFloat v = apx * cpy - apy * cpx;
         YmmFloat w = bpx * apy - bpy * apx;
@@ -1011,9 +1160,9 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         YmmFloat det = u + v + w;
         YmmFloat is_valid_hit = is_interior & (det != YmmFloat::set1(0));
         if (is_valid_hit.any()) {
-            YmmFloat apz = ray_space_shear.sz * ap.z;
-            YmmFloat bpz = ray_space_shear.sz * bp.z;
-            YmmFloat cpz = ray_space_shear.sz * cp.z;
+            YmmFloat apz = ray_space.sz * ap.z;
+            YmmFloat bpz = ray_space.sz * bp.z;
+            YmmFloat cpz = ray_space.sz * cp.z;
             YmmFloat t = u * apz + v * bpz + w * cpz;
             YmmFloat scaled_min_param = min_param * det;
             YmmFloat scaled_max_param = max_param * det;
@@ -1025,7 +1174,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
             }
         }
     }
-    
+
     void process_triangle_triple_point_indexed(YmmInt is_triangle, YmmInt triangle_index) {
         XmmFloatData const* triangles_ptr = (XmmFloatData const*)chunk.triangles;
         XmmFloat triangle_data[8];
@@ -1052,7 +1201,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         c.z = _mm256_i32gather_ps((float const*)chunk.vertices + 2, coffset, 4);
         process_triangle_triple_point_common(is_triangle, triangle_index, a, b, c);
     }
-    
+
     void process_triangle_triple_point_immediate(YmmInt is_triangle, YmmInt triangle_index) {
         YmmFloatData const* triangles_ptr = (YmmFloatData const*)chunk.triangles;
         YmmFloat triangle_data_a[8];
@@ -1065,7 +1214,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         c.z = _mm256_i32gather_ps((float const*)chunk.triangles + 8, czoffset, 4);
         process_triangle_triple_point_common(is_triangle, triangle_index, a, b, c);
     }
-    
+
     void process_triangle_middle_coord_permuted(YmmBox box, YmmInt is_triangle, YmmInt triangle_index) {
         XmmFloatData const* triangles_ptr = (XmmFloatData const*)chunk.triangles;
         XmmFloat triangle_data[8];
@@ -1155,7 +1304,7 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
         }
         process_triangle_box_centered_common(is_triangle, triangle_index, center, du, dv, dn);
     }
-    
+
     void process_triangle(YmmBox box, YmmInt is_triangle, YmmInt triangle_index) {
         switch (pipeline.params.triangle_rep) {
         case RayPipelineParams::TriangleRep::TriplePointIndexed:
@@ -1189,7 +1338,11 @@ struct RayPipeline::Internal::ChunkIntersectorSimd {
     }
 
     void process() {
-        ray_space_shear = YmmSpaceShear::make_for(direction);
+        {
+            Vec3 root_box_min, root_box_max;
+            Utils::get_box_minmax(pipeline.params, chunk.nodes[0].box, root_box_min, root_box_max);
+            ray_space = YmmRaySpace::make_for(origin, direction, root_box_min, root_box_max);
+        }
         YmmInt sentinel_node_index = YmmInt::set1(chunk.sentinel_node_index);
         YmmInt node_index = YmmInt::set1(0);
         while (true) {
@@ -1391,7 +1544,8 @@ struct RayPipeline::Internal::TreeProcessor: Processor {
 };
 
 RayPipeline::Internal::TreeProcessor::TreeProcessor(RayPipeline& pipeline, size_t zone_id)
-    : Processor(pipeline.processor_control), pipeline(pipeline), ptree(*pipeline.zone_trees[zone_id]), zone_id(zone_id) {
+    : Processor(pipeline.processor_control), pipeline(pipeline), ptree(*pipeline.zone_trees[zone_id]), zone_id(zone_id)
+{
 }
 
 bool RayPipeline::Internal::TreeProcessor::has_pending_work_impl() {
